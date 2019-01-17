@@ -56,6 +56,8 @@ type Options struct {
 
 	Upstreams             []string      `flag:"upstream" cfg:"upstreams" env:"OAUTH2_PROXY_UPSTREAMS"`
 	SkipAuthRegex         []string      `flag:"skip-auth-regex" cfg:"skip_auth_regex" env:"OAUTH2_PROXY_SKIP_AUTH_REGEX"`
+	SkipJwtBearerTokens   bool          `flag:"skip-jwt-bearer-tokens" cfg:"skip_jwt_bearer_tokens"`
+	ExtraJwtIssuers       []string      `flag:"extra-jwt-issuers" cfg:"extra_jwt_issuers"`
 	PassBasicAuth         bool          `flag:"pass-basic-auth" cfg:"pass_basic_auth" env:"OAUTH2_PROXY_PASS_BASIC_AUTH"`
 	BasicAuthPassword     string        `flag:"basic-auth-password" cfg:"basic_auth_password" env:"OAUTH2_PROXY_BASIC_AUTH_PASSWORD"`
 	PassAccessToken       bool          `flag:"pass-access-token" cfg:"pass_access_token" env:"OAUTH2_PROXY_PASS_ACCESS_TOKEN"`
@@ -92,12 +94,14 @@ type Options struct {
 	PubJWKURL    string `flag:"pubjwk-url" cfg:"pubjwk_url" env:"OAUTH2_PROXY_PUBJWK_URL"`
 
 	// internal values that are set after config validation
-	redirectURL   *url.URL
-	proxyURLs     []*url.URL
-	CompiledRegex []*regexp.Regexp
-	provider      providers.Provider
-	signatureData *SignatureData
-	oidcVerifier  *oidc.IDTokenVerifier
+	redirectURL        *url.URL
+	proxyURLs          []*url.URL
+	CompiledRegex      []*regexp.Regexp
+	provider           providers.Provider
+	signatureData      *SignatureData
+	oidcVerifier       *oidc.IDTokenVerifier
+	jwtIssuers         [][]string
+	jwtBearerVerifiers []*oidc.IDTokenVerifier
 }
 
 // SignatureData holds hmacauth signature hash and key
@@ -207,6 +211,38 @@ func (o *Options) Validate() error {
 		}
 		if o.Scope == "" {
 			o.Scope = "openid email profile"
+		}
+	}
+
+	if o.SkipJwtBearerTokens {
+		// If we are using an oidc provider, go ahead and add that provider to the list
+		if o.oidcVerifier != nil {
+			o.jwtBearerVerifiers = append(o.jwtBearerVerifiers, o.oidcVerifier)
+		}
+		// Configure extra issuers
+		if len(o.ExtraJwtIssuers) > 0 {
+			msgs = parseJwtIssuers(o, msgs)
+			for _, pair := range o.jwtIssuers {
+				issuer, audience := pair[0], pair[1]
+				config := &oidc.Config{
+					ClientID: audience,
+				}
+				// Try as an OpenID Connect Provider first
+				var verifier *oidc.IDTokenVerifier
+				provider, err := oidc.NewProvider(context.Background(), issuer)
+				if err != nil {
+					// Try as JWKS URI
+					jwksUri := strings.TrimSuffix(issuer, "/") + "/.well-known/jwks.json"
+					_, err := http.NewRequest("GET", jwksUri, nil)
+					if err != nil {
+						return err
+					}
+					verifier = oidc.NewVerifier(issuer, oidc.NewRemoteKeySet(context.Background(), jwksUri), config)
+				} else {
+					verifier = provider.Verifier(config)
+				}
+				o.jwtBearerVerifiers = append(o.jwtBearerVerifiers, verifier)
+			}
 		}
 	}
 
@@ -359,6 +395,19 @@ func parseSignatureKey(o *Options, msgs []string) []string {
 			o.SignatureKey)
 	}
 	o.signatureData = &SignatureData{hash, secretKey}
+	return msgs
+}
+
+func parseJwtIssuers(o *Options, msgs []string) []string {
+	for _, jwtVerifier := range o.ExtraJwtIssuers {
+		components := strings.Split(jwtVerifier, "=")
+		if len(components) < 2 {
+			return append(msgs, "invalid jwt verifier uri=audience spec: "+
+				jwtVerifier)
+		}
+		uri, audience := components[0], strings.Join(components[1:], "=")
+		o.jwtIssuers = append(o.jwtIssuers, []string{uri, audience})
+	}
 	return msgs
 }
 
