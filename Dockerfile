@@ -13,6 +13,7 @@ RUN ./configure && make clean oauth2_proxy
 
 # Copy binary to debian
 FROM debian:stretch
+RUN apt-get update && apt-get -y install ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /go/src/github.com/pusher/oauth2_proxy/oauth2_proxy /bin/oauth2_proxy
 
 ENTRYPOINT ["/bin/oauth2_proxy"]
