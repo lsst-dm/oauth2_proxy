@@ -1038,6 +1038,7 @@ func (p *OAuthProxy) GetJwtSession(req *http.Request) (*providers.SessionState, 
 
 		session = &providers.SessionState{
 			AccessToken:  rawBearerToken,
+			IDToken:      rawBearerToken,
 			RefreshToken: "",
 			ExpiresOn:    bearerToken.Expiry,
 			Email:        claims.Email,
