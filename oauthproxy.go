@@ -909,6 +909,9 @@ func (p *OAuthProxy) CheckBasicAuth(req *http.Request) (*providers.SessionState,
 	return nil, fmt.Errorf("%s not in HtpasswdFile", pair[0])
 }
 
+// GetJwtSession checks the Authorization header for bearer tokens, both by looking
+// for explicit tokens after the `Bearer` keyword, or also tokens hiding out after the
+// `Basic` keyword with a username/password of `x-oauth-basic`.
 func (p *OAuthProxy) GetJwtSession(req *http.Request) (*providers.SessionState, error) {
 	auth := req.Header.Get("Authorization")
 	ctx := context.Background()
