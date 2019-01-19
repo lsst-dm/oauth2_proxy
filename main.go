@@ -20,6 +20,7 @@ func main() {
 	emailDomains := StringArray{}
 	upstreams := StringArray{}
 	skipAuthRegex := StringArray{}
+	jwtBearerIssuers := StringArray{}
 	googleGroups := StringArray{}
 
 	config := flagSet.String("config", "", "path to config file")
@@ -43,6 +44,8 @@ func main() {
 	flagSet.Bool("skip-provider-button", false, "will skip sign-in-page to directly reach the next step: oauth/start")
 	flagSet.Bool("skip-auth-preflight", false, "will skip authentication for OPTIONS requests")
 	flagSet.Bool("ssl-insecure-skip-verify", false, "skip validation of certificates presented when using HTTPS")
+	flagSet.Bool("skip-jwt-bearer", false, "will skip requests that have verified JWT bearer tokens")
+	flagSet.Var(&jwtBearerIssuers, "jwt-bearer-issuers", "list of JWT bearer issuers URLs (with a .well-known/openid-configuration or a .well-known/jwks.json) and associated audience, in the form of (uri=audience)")
 
 	flagSet.Var(&emailDomains, "email-domain", "authenticate emails with the specified domain (may be given multiple times). Use * to authenticate any email")
 	flagSet.String("azure-tenant", "common", "go to a tenant-specific or common (tenant-independent) endpoint.")
