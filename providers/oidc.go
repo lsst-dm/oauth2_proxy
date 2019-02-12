@@ -122,11 +122,12 @@ func (p *OIDCProvider) createSessionState(ctx context.Context, token *oauth2.Tok
 		return nil, fmt.Errorf("email in id_token (%s) isn't verified", claims.Email)
 	}
 
+	// Use idToken.Expiry because that's what we verify against
 	return &SessionState{
 		AccessToken:  token.AccessToken,
 		IDToken:      rawIDToken,
 		RefreshToken: token.RefreshToken,
-		ExpiresOn:    token.Expiry,
+		ExpiresOn:    idToken.Expiry,
 		Email:        claims.Email,
 	}, nil
 }
