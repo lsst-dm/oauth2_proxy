@@ -3,7 +3,11 @@
 ## Changes since v3.2.0
 
 - [#111](https://github.com/pusher/oauth2_proxy/pull/111) Add option for telling where to find a login.gov JWT key file (@timothy-spencer)
-
+- [#65](https://github.com/pusher/oauth2_proxy/pull/65) Improvements to authenticate requests with a JWT bearer token in the `Authorization` header via
+  the `-skip-jwt-bearer-token` options. 
+  - Additional verifiers can be configured via the `-extra-jwt-issuers` flag if the JWT issuers is either an OpenID provider or has a JWKS URL 
+  (e.g. `https://example.com/.well-known/jwks.json`).
+  
 # v3.2.0
 
 ## Release highlights
