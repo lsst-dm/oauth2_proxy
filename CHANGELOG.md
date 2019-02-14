@@ -1,6 +1,10 @@
 # Vx.x.x (Pre-release)
 
 ## Changes since v3.1.0
+- Improvements to authenticate requests with a JWT bearer token in the `Authorization` header via
+  the `-skip-jwt-bearer-token` options. If present, additional verifiers can be configured 
+  via the `-extra-jwt-issuers` flag if the JWT issuers is either an OpenID provider or has a JWKS URL 
+  (e.g. `https://example.com/.well-known/jwks.json`).
 
 # v3.1.0
 
