@@ -39,6 +39,7 @@ type Options struct {
 	GoogleGroups             []string `flag:"google-group" cfg:"google_group"`
 	GoogleAdminEmail         string   `flag:"google-admin-email" cfg:"google_admin_email"`
 	GoogleServiceAccountJSON string   `flag:"google-service-account-json" cfg:"google_service_account_json"`
+	ServerCookiesPath        string   `flag:"server-cookies-path" cfg:"server_cookies_path"`
 	HtpasswdFile             string   `flag:"htpasswd-file" cfg:"htpasswd_file"`
 	DisplayHtpasswdForm      bool     `flag:"display-htpasswd-form" cfg:"display_htpasswd_form"`
 	CustomTemplatesDir       string   `flag:"custom-templates-dir" cfg:"custom_templates_dir"`
@@ -258,6 +259,14 @@ func (o *Options) Validate() error {
 					"pass_access_token == true or "+
 					"cookie_refresh != 0, but is %d bytes.%s",
 				len(secretBytes(o.CookieSecret)), suffix))
+		}
+	}
+
+	if o.ServerCookiesPath != "" {
+		if file, err := os.Stat(o.ServerCookiesPath); os.IsNotExist(err) {
+			msgs = append(msgs, "server-cookies-path does not exist")
+		} else if !file.IsDir() {
+			msgs = append(msgs, "server-cookies-path is not a directory")
 		}
 	}
 

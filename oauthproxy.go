@@ -87,6 +87,7 @@ type OAuthProxy struct {
 	PassAccessToken     bool
 	SetAuthorization    bool
 	PassAuthorization   bool
+	CookiesStore        cookie.ServerCookiesStore
 	CookieCipher        *cookie.Cipher
 	skipAuthRegex       []string
 	skipAuthPreflight   bool
@@ -212,6 +213,11 @@ func NewOAuthProxy(opts *Options, validator func(string) bool) *OAuthProxy {
 		}
 	}
 
+	var cookiesStore cookie.ServerCookiesStore
+	if opts.ServerCookiesPath != "" {
+		cookiesStore = cookie.FileSystemCookieStore{opts.ServerCookiesPath, cipher.Block}
+	}
+
 	return &OAuthProxy{
 		CookieName:     opts.CookieName,
 		CSRFCookieName: fmt.Sprintf("%v_%v", opts.CookieName, "csrf"),
@@ -251,6 +257,7 @@ func NewOAuthProxy(opts *Options, validator func(string) bool) *OAuthProxy {
 		CookieCipher:        cipher,
 		templates:           loadTemplates(opts.CustomTemplatesDir),
 		Footer:              opts.Footer,
+		CookiesStore:        cookiesStore,
 	}
 }
 
@@ -308,7 +315,26 @@ func (p *OAuthProxy) MakeSessionCookie(req *http.Request, value string, expirati
 		value = cookie.SignedValue(p.CookieSeed, p.CookieName, value, now)
 	}
 	c := p.makeCookie(req, p.CookieName, value, expiration, now)
-	if len(c.Value) > 4096-len(p.CookieName) {
+
+	if p.CookiesStore != nil {
+		// Cleanup old cookies that might be hanging around
+		for _, requestCookie := range req.Cookies() {
+			if requestCookie.Name == p.CookieName {
+				err := p.CookiesStore.Clear(requestCookie)
+				if err != nil {
+					log.Printf("Unable to clear cookies: %s", err)
+				}
+			}
+		}
+
+		// Store new cookie
+		newCookieValue, err := p.CookiesStore.Store(c)
+		if err != nil {
+			log.Printf("Unable to load cookie: %s", err)
+		}
+		responseCookie := p.makeCookie(req, p.CookieName, newCookieValue, p.CookieExpire, now)
+		return []*http.Cookie{responseCookie}
+	} else if len(c.Value) > 4096-len(p.CookieName) {
 		return splitCookie(c)
 	}
 	return []*http.Cookie{c}
@@ -440,16 +466,23 @@ func (p *OAuthProxy) SetCSRFCookie(rw http.ResponseWriter, req *http.Request, va
 // ClearSessionCookie creates a cookie to unset the user's authentication cookie
 // stored in the user's session
 func (p *OAuthProxy) ClearSessionCookie(rw http.ResponseWriter, req *http.Request) {
-	cookies := p.MakeSessionCookie(req, "", time.Hour*-1, time.Now())
-	for _, clr := range cookies {
-		http.SetCookie(rw, clr)
-	}
-
-	// ugly hack because default domain changed
-	if p.CookieDomain == "" && len(cookies) > 0 {
-		clr2 := *cookies[0]
-		clr2.Domain = req.Host
-		http.SetCookie(rw, &clr2)
+	// Clear All cookies, including Split cookies
+	for _, requestCookie := range req.Cookies() {
+		if requestCookie.Name != p.CSRFCookieName {
+			if requestCookie.Name == p.CookieName {
+				if p.CookiesStore != nil {
+					err := p.CookiesStore.Clear(requestCookie)
+					if err != nil {
+						log.Printf("Unable to clear cookies: %s", err)
+					}
+				}
+				clr := p.makeCookie(req, requestCookie.Name, "", time.Hour*-1, time.Now())
+				http.SetCookie(rw, clr)
+			} else if strings.Contains(requestCookie.Name, p.CookieName+".") {
+				clr := p.makeCookie(req, requestCookie.Name, "", time.Hour*-1, time.Now())
+				http.SetCookie(rw, clr)
+			}
+		}
 	}
 }
 
@@ -467,6 +500,14 @@ func (p *OAuthProxy) LoadCookiedSession(req *http.Request) (*providers.SessionSt
 	if err != nil {
 		// always http.ErrNoCookie
 		return nil, age, fmt.Errorf("Cookie %q not present", p.CookieName)
+	}
+	if p.CookiesStore != nil {
+		// If using a cookie store, load the actual value
+		loadedValue, err := p.CookiesStore.Load(c)
+		if err != nil {
+			return nil, age, fmt.Errorf("Unable to load cookie: %s", err)
+		}
+		c.Value = loadedValue
 	}
 	val, timestamp, ok := cookie.Validate(c, p.CookieSeed, p.CookieExpire)
 	if !ok {
