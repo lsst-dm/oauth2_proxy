@@ -1017,7 +1017,7 @@ func (p *OAuthProxy) ErrorJSON(rw http.ResponseWriter, code int) {
 	rw.WriteHeader(code)
 }
 
-// Load a session based on a JWT token
+// GetJwtSession loads a session based on a JWT token in the authorization header.
 func (p *OAuthProxy) GetJwtSession(req *http.Request) (*providers.SessionState, error) {
 	auth := req.Header.Get("Authorization")
 	ctx := context.Background()
