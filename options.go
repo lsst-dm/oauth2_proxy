@@ -198,12 +198,12 @@ func (o *Options) Validate() error {
 				provider, err := oidc.NewProvider(context.Background(), issuer)
 				if err != nil {
 					// Try as JWKS URI
-					jwksUri := strings.TrimSuffix(issuer, "/") + "/.well-known/jwks.json"
-					_, err := http.NewRequest("GET", jwksUri, nil)
+					jwksURI := strings.TrimSuffix(issuer, "/") + "/.well-known/jwks.json"
+					_, err := http.NewRequest("GET", jwksURI, nil)
 					if err != nil {
 						return err
 					}
-					verifier = oidc.NewVerifier(issuer, oidc.NewRemoteKeySet(context.Background(), jwksUri), config)
+					verifier = oidc.NewVerifier(issuer, oidc.NewRemoteKeySet(context.Background(), jwksURI), config)
 				} else {
 					verifier = provider.Verifier(config)
 				}
