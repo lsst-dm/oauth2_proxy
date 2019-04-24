@@ -848,7 +848,7 @@ func (p *OAuthProxy) Authenticate(rw http.ResponseWriter, req *http.Request) int
 	if p.skipJwtBearerTokens && req.Header.Get("Authorization") != "" {
 		session, err = p.GetJwtSession(req)
 		if err != nil {
-			logger.Printf("Error validating JWT token from Authorization header: %s", err)
+			logger.Printf("Error retrieving session from token in Authorization header: %s", err)
 		}
 		if session != nil {
 			saveSession = false
@@ -1077,9 +1077,9 @@ func (p *OAuthProxy) findBearerToken(req *http.Request) (string, error) {
 	if len(s) != 2 {
 		return "", fmt.Errorf("invalid authorization header %s", auth)
 	}
-
+	jwtRegex := regexp.MustCompile(`^eyJ[a-zA-Z0-9_-]*\.eyJ[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]+$`)
 	var rawBearerToken string
-	if s[0] == "Bearer" {
+	if s[0] == "Bearer" && jwtRegex.MatchString(s[1]) {
 		rawBearerToken = s[1]
 	} else if s[0] == "Basic" {
 		// Check if we have a Bearer token masquerading in Basic
@@ -1094,7 +1094,6 @@ func (p *OAuthProxy) findBearerToken(req *http.Request) (string, error) {
 		user, password := pair[0], pair[1]
 
 		// check user, user+password, or just password for a token
-		jwtRegex := regexp.MustCompile(`^eyJ[a-zA-Z0-9_-]*\.eyJ[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]+$`)
 		if jwtRegex.MatchString(user) {
 			// Support blank passwords or magic `x-oauth-basic` passwords - nothing else
 			if password == "" || password == "x-oauth-basic" {
@@ -1104,8 +1103,9 @@ func (p *OAuthProxy) findBearerToken(req *http.Request) (string, error) {
 			// support passwords and ignore user
 			rawBearerToken = password
 		}
-	} else {
-		return "", fmt.Errorf("invalid authorization header %s", auth)
+	}
+	if rawBearerToken == "" {
+		return "", fmt.Errorf("no valid bearer token found in authorization header")
 	}
 
 	return rawBearerToken, nil
