@@ -5,7 +5,6 @@ import (
 	b64 "encoding/base64"
 	"errors"
 	"fmt"
-	"github.com/go-redis/redis"
 	"html/template"
 	"log"
 	"net"
@@ -17,6 +16,7 @@ import (
 	"time"
 
 	"github.com/coreos/go-oidc"
+	"github.com/go-redis/redis"
 	"github.com/mbland/hmacauth"
 	"github.com/pusher/oauth2_proxy/cookie"
 	"github.com/pusher/oauth2_proxy/providers"
@@ -90,6 +90,7 @@ type OAuthProxy struct {
 	PassAccessToken     bool
 	SetAuthorization    bool
 	PassAuthorization   bool
+	CookiesStore        cookie.ServerCookiesStore
 	CookieCipher        *cookie.Cipher
 	skipAuthRegex       []string
 	skipAuthPreflight   bool
@@ -273,7 +274,6 @@ func NewOAuthProxy(opts *Options, validator func(string) bool) *OAuthProxy {
 		provider:            opts.provider,
 		serveMux:            serveMux,
 		redirectURL:         redirectURL,
-		whitelistDomains:    opts.WhitelistDomains,
 		skipAuthRegex:       opts.SkipAuthRegex,
 		skipAuthPreflight:   opts.SkipAuthPreflight,
 		skipJwtBearerTokens: opts.SkipJwtBearerTokens,
@@ -1135,18 +1135,44 @@ func (p *OAuthProxy) findBearerToken(req *http.Request) (string, error) {
 		user, password := pair[0], pair[1]
 
 		// check user, user+password, or just password for a token
-		if jwtRegex.MatchString(user) {
+		if jwtRegex.MatchString(user) || strings.HasPrefix(user, p.CookieName) {
 			// Support blank passwords or magic `x-oauth-basic` passwords - nothing else
 			if password == "" || password == "x-oauth-basic" {
 				rawBearerToken = user
 			}
-		} else if jwtRegex.MatchString(password) {
+		}
+		if jwtRegex.MatchString(password) || strings.HasPrefix(password, p.CookieName) {
 			// support passwords and ignore user
 			rawBearerToken = password
 		}
 	}
 	if rawBearerToken == "" {
 		return "", fmt.Errorf("no valid bearer token found in authorization header")
+	}
+
+	// Check if this is actually a session identifier
+	if p.CookiesStore != nil && strings.HasPrefix(rawBearerToken, p.CookieName) {
+		// Mock the header as a request cookie
+		c := &http.Cookie{Name: p.CookieName, Value: rawBearerToken}
+		signedSession, err := p.CookiesStore.Load(c)
+		if err != nil {
+			log.Printf("error loading ticket from store: %v", err)
+		}
+		// Only proceed if we found a cookie in the cookie store
+		if err == nil {
+			c.Value = signedSession
+			serverSession, _, err := cookie.Validate(c, p.CookieSeed, p.CookieExpire)
+			if err != nil {
+				return "", fmt.Errorf("unable to validate cookie loaded from cookie store: %v", err)
+			}
+			session, err := providers.DecodeSessionState(serverSession, p.CookieCipher)
+			if err != nil {
+				return "", fmt.Errorf("unable to decode session from cookie store: %v", err)
+			}
+			rawBearerToken = session.IDToken
+		}
+	} else {
+		log.Printf("not checking ticket: %s, prefix: %s", rawBearerToken, p.CookieName)
 	}
 
 	return rawBearerToken, nil
