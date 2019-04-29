@@ -42,3 +42,7 @@
 [[constraint]]
   branch = "master"
   name = "golang.org/x/crypto"
+
+[[constraint]]
+  name = "github.com/alicebob/miniredis"
+  version = "2.7.0"
