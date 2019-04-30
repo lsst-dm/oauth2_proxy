@@ -352,7 +352,7 @@ func (p *OAuthProxy) MakeSessionCookie(req *http.Request, value string, expirati
 		// Proactively cleanup old cookies that might be hanging around
 		for _, requestCookie := range req.Cookies() {
 			if requestCookie.Name == p.CookieName {
-				err := p.CookiesStore.Clear(requestCookie)
+				_, err := p.CookiesStore.Clear(requestCookie)
 				if err != nil {
 					log.Printf("Unable to clear cookies: %s", err)
 				}
@@ -507,7 +507,7 @@ func (p *OAuthProxy) ClearSessionCookie(rw http.ResponseWriter, req *http.Reques
 
 	for _, c := range req.Cookies() {
 		if p.CookiesStore != nil && c.Name == p.CookieName {
-			err := p.CookiesStore.Clear(c)
+			_, err := p.CookiesStore.Clear(c)
 			if err != nil {
 				log.Printf("Unable to clear cookie: %s", err)
 			}

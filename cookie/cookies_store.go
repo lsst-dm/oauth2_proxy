@@ -20,7 +20,7 @@ import (
 // It takes in cookies
 type ServerCookiesStore interface {
 	Store(responseCookie *http.Cookie, requestCookie *http.Cookie) (string, error)
-	Clear(requestCookie *http.Cookie) error
+	Clear(requestCookie *http.Cookie) (bool, error)
 	Load(requestCookie *http.Cookie) (string, error)
 }
 
@@ -88,19 +88,20 @@ func (store *RedisCookieStore) Store(responseCookie *http.Cookie, requestCookie 
 }
 
 // Clear takes in the client cookie from the request and uses it to
-// clear any lingering server cookies, when possible.
-func (store *RedisCookieStore) Clear(requestCookie *http.Cookie) error {
+// clear any lingering server cookies, when possible. It returns true if anything
+// was deleted.
+func (store *RedisCookieStore) Clear(requestCookie *http.Cookie) (bool, error) {
 	var err error
 	cookieHandle, _, err := parseCookieTicket(store.Prefix, requestCookie.Value)
 	if err != nil {
-		return err
+		return false, err
 	}
 
-	err = store.Client.Del(cookieHandle).Err()
+	deleted, err := store.Client.Del(cookieHandle).Result()
 	if err != nil {
-		return err
+		return false, err
 	}
-	return nil
+	return deleted > 0, nil
 }
 
 // Load takes in the client cookie from the request and uses it to lookup
@@ -123,21 +124,23 @@ func (store *RedisCookieStore) Load(requestCookie *http.Cookie) (string, error) 
 	return string(resultBytes), nil
 }
 
-func parseCookieTicket(expectedPrefix string, ticket string) (string, []byte, error) {
-	cookieParts := strings.Split(ticket, ".")
+func parseCookieTicket(cookieName string, ticket string) (string, []byte, error) {
+	prefix := cookieName + "-"
+	if !strings.HasPrefix(ticket, prefix) {
+		return "", nil, fmt.Errorf("failed to decode cookie handle")
+	}
+	trimmedTicket := strings.TrimPrefix(ticket, prefix)
+
+	cookieParts := strings.Split(trimmedTicket, ".")
 	if len(cookieParts) != 2 {
 		return "", nil, fmt.Errorf("failed to decode cookie")
 	}
-	cookieHandle, ivBase64 := cookieParts[0], cookieParts[1]
-	handleParts := strings.Split(cookieHandle, "-")
-	if len(handleParts) != 2 {
-		return "", nil, fmt.Errorf("failed to decode cookie handle")
-	}
-	prefix, cookieID := handleParts[0], handleParts[1]
+	cookieID, ivBase64 := cookieParts[0], cookieParts[1]
+	cookieHandle := prefix + cookieID
 
 	// cookieID must be a hexadecimal string
 	_, err := hex.DecodeString(cookieID)
-	if err != nil || expectedPrefix != prefix {
+	if err != nil {
 		return "", nil, fmt.Errorf("server cookie failed sanity checks")
 		// s is not a valid
 	}
