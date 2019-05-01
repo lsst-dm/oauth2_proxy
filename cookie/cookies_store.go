@@ -16,25 +16,60 @@ import (
 	"github.com/go-redis/redis"
 )
 
-// ServerCookiesStore is the interface to storing cookies.
-// It takes in cookies
-type ServerCookiesStore interface {
-	Store(responseCookie *http.Cookie, requestCookie *http.Cookie) (string, error)
+const (
+	// Cookies are limited to 4kb including the length of the cookie name,
+	// the cookie name can be up to 256 bytes
+	maxCookieLength = 3840
+)
+
+// Store is the interface to storing cookies.
+type Store interface {
+	Store(request *http.Request, value string, expiration time.Duration, now time.Time) ([]*http.Cookie, error)
 	Clear(requestCookie *http.Cookie) (bool, error)
-	Load(requestCookie *http.Cookie) (string, error)
+	Load(request *http.Request) (string, error)
 }
 
-// RedisCookieStore is an Redis-backed implementation of a ServerCookiesStore.
+// RedisCookieStore is an Redis-backed implementation of a Store.
 // It stores the cookies according to the cookie ticket, which is composed of
 // a Prefix (the same as the CookieName) and a handle (a random identifier)
 type RedisCookieStore struct {
-	Client *redis.Client
-	Block  cipher.Block
-	Prefix string
+	Client     *redis.Client
+	Block      cipher.Block
+	Maker      *Maker
+	CookieName string
+}
+
+// BrowserCookieStore is the traditional cookie store that creates the default cookies
+type BrowserCookieStore struct {
+	Maker      *Maker
+	CookieName string
+}
+
+// Store returns cookies to send back to the user.
+func (store *BrowserCookieStore) Store(request *http.Request, value string, expiration time.Duration, now time.Time) ([]*http.Cookie, error) {
+	c := store.Maker.Make(request, store.CookieName, value, expiration, now)
+	if len(c.Value) > 4096-len(store.CookieName) {
+		return splitCookie(c), nil
+	}
+	return []*http.Cookie{c}, nil
+}
+
+// Clear creates a clear cookie that's sent back.
+func (store *BrowserCookieStore) Clear(requestCookie *http.Cookie) (bool, error) {
+	return false, nil
+}
+
+// Load returns the value for the cookie
+func (store *BrowserCookieStore) Load(request *http.Request) (string, error) {
+	c, err := loadCookie(request, store.CookieName)
+	if err != nil {
+		return "", fmt.Errorf("failed to load cookie %s", err)
+	}
+	return c.Value, nil
 }
 
 // NewRedisCookieStore constructs a new Redis-backed Server cookie store.
-func NewRedisCookieStore(url string, cookieName string, block cipher.Block) (*RedisCookieStore, error) {
+func NewRedisCookieStore(url string, cookieName string, cookieMaker *Maker, block cipher.Block) (*RedisCookieStore, error) {
 	opt, err := redis.ParseURL(url)
 	if err != nil {
 		panic(err)
@@ -43,9 +78,10 @@ func NewRedisCookieStore(url string, cookieName string, block cipher.Block) (*Re
 	client := redis.NewClient(opt)
 
 	rs := &RedisCookieStore{
-		Client: client,
-		Prefix: cookieName,
-		Block:  block,
+		Client:     client,
+		Maker:      cookieMaker,
+		Block:      block,
+		CookieName: cookieName,
 	}
 	// Create client as usually.
 	return rs, nil
@@ -53,38 +89,42 @@ func NewRedisCookieStore(url string, cookieName string, block cipher.Block) (*Re
 
 // Store stores the cookie locally and returns a new response cookie value to be
 // sent back to the client. That value is used to lookup the cookie later.
-func (store *RedisCookieStore) Store(responseCookie *http.Cookie, requestCookie *http.Cookie) (string, error) {
+func (store *RedisCookieStore) Store(request *http.Request, value string, expiration time.Duration, now time.Time) ([]*http.Cookie, error) {
 	var cookieHandle string
 	var iv []byte
+	requestCookie, _ := request.Cookie(store.CookieName)
 	if requestCookie != nil {
 		var err error
-		cookieHandle, iv, err = parseCookieTicket(store.Prefix, requestCookie.Value)
+		cookieHandle, iv, err = parseCookieTicket(store.CookieName, requestCookie.Value)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 	} else {
 		hasher := sha1.New()
-		hasher.Write([]byte(responseCookie.Value))
+		hasher.Write([]byte(value))
 		cookieID := fmt.Sprintf("%x", hasher.Sum(nil))
 		iv = make([]byte, aes.BlockSize)
 		if _, err := io.ReadFull(rand.Reader, iv); err != nil {
-			return "", fmt.Errorf("failed to create initialization vector %s", err)
+			return nil, fmt.Errorf("failed to create initialization vector %s", err)
 		}
-		cookieHandle = fmt.Sprintf("%s-%s", store.Prefix, cookieID)
+		cookieHandle = fmt.Sprintf("%s-%s", store.CookieName, cookieID)
 	}
 
-	ciphertext := make([]byte, len(responseCookie.Value))
+	ciphertext := make([]byte, len(value))
 	stream := cipher.NewCFBEncrypter(store.Block, iv)
-	stream.XORKeyStream(ciphertext, []byte(responseCookie.Value))
+	stream.XORKeyStream(ciphertext, []byte(value))
 
-	expires := responseCookie.Expires.Sub(time.Now())
-	err := store.Client.Set(cookieHandle, ciphertext, expires).Err()
+	err := store.Client.Set(cookieHandle, ciphertext, expiration).Err()
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	cookieTicket := cookieHandle + "." + base64.RawURLEncoding.EncodeToString(iv)
-	return cookieTicket, nil
+	if requestCookie == nil {
+		responseCookie := store.Maker.Make(request, store.CookieName, cookieTicket, expiration, now)
+		return []*http.Cookie{responseCookie}, nil
+	}
+	return nil, nil
 }
 
 // Clear takes in the client cookie from the request and uses it to
@@ -92,7 +132,7 @@ func (store *RedisCookieStore) Store(responseCookie *http.Cookie, requestCookie 
 // was deleted.
 func (store *RedisCookieStore) Clear(requestCookie *http.Cookie) (bool, error) {
 	var err error
-	cookieHandle, _, err := parseCookieTicket(store.Prefix, requestCookie.Value)
+	cookieHandle, _, err := parseCookieTicket(store.CookieName, requestCookie.Value)
 	if err != nil {
 		return false, err
 	}
@@ -106,8 +146,12 @@ func (store *RedisCookieStore) Clear(requestCookie *http.Cookie) (bool, error) {
 
 // Load takes in the client cookie from the request and uses it to lookup
 // the stored value.
-func (store *RedisCookieStore) Load(requestCookie *http.Cookie) (string, error) {
-	cookieHandle, iv, err := parseCookieTicket(store.Prefix, requestCookie.Value)
+func (store *RedisCookieStore) Load(request *http.Request) (string, error) {
+	c, err := request.Cookie(store.CookieName)
+	if err != nil {
+		return "", fmt.Errorf("unable to load cookie: %s", err)
+	}
+	cookieHandle, iv, err := parseCookieTicket(store.CookieName, c.Value)
 	if err != nil {
 		return "", err
 	}
@@ -150,4 +194,89 @@ func parseCookieTicket(cookieName string, ticket string) (string, []byte, error)
 		return "", nil, fmt.Errorf("failed to decode initialization vector %s", err)
 	}
 	return cookieHandle, iv, nil
+}
+
+func copyCookie(c *http.Cookie) *http.Cookie {
+	return &http.Cookie{
+		Name:       c.Name,
+		Value:      c.Value,
+		Path:       c.Path,
+		Domain:     c.Domain,
+		Expires:    c.Expires,
+		RawExpires: c.RawExpires,
+		MaxAge:     c.MaxAge,
+		Secure:     c.Secure,
+		HttpOnly:   c.HttpOnly,
+		Raw:        c.Raw,
+		Unparsed:   c.Unparsed,
+	}
+}
+
+// splitCookie reads the full cookie generated to store the session and splits
+// it into a slice of cookies which fit within the 4kb cookie limit indexing
+// the cookies from 0
+func splitCookie(c *http.Cookie) []*http.Cookie {
+	if len(c.Value) < maxCookieLength {
+		return []*http.Cookie{c}
+	}
+	cookies := []*http.Cookie{}
+	valueBytes := []byte(c.Value)
+	count := 0
+	for len(valueBytes) > 0 {
+		newCookie := copyCookie(c)
+		newCookie.Name = fmt.Sprintf("%s_%d", c.Name, count)
+		count++
+		if len(valueBytes) < maxCookieLength {
+			newCookie.Value = string(valueBytes)
+			valueBytes = []byte{}
+		} else {
+			newValue := valueBytes[:maxCookieLength]
+			valueBytes = valueBytes[maxCookieLength:]
+			newCookie.Value = string(newValue)
+		}
+		cookies = append(cookies, newCookie)
+	}
+	return cookies
+}
+
+// joinCookies takes a slice of cookies from the request and reconstructs the
+// full session cookie
+func joinCookies(cookies []*http.Cookie) (*http.Cookie, error) {
+	if len(cookies) == 0 {
+		return nil, fmt.Errorf("list of cookies must be > 0")
+	}
+	if len(cookies) == 1 {
+		return cookies[0], nil
+	}
+	c := copyCookie(cookies[0])
+	for i := 1; i < len(cookies); i++ {
+		c.Value += cookies[i].Value
+	}
+	c.Name = strings.TrimRight(c.Name, "_0")
+	return c, nil
+}
+
+// loadCookie retreieves the sessions state cookie from the http request.
+// If a single cookie is present this will be returned, otherwise it attempts
+// to reconstruct a cookie split up by splitCookie
+func loadCookie(req *http.Request, cookieName string) (*http.Cookie, error) {
+	c, err := req.Cookie(cookieName)
+	if err == nil {
+		return c, nil
+	}
+	cookies := []*http.Cookie{}
+	err = nil
+	count := 0
+	for err == nil {
+		var c *http.Cookie
+		c, err = req.Cookie(fmt.Sprintf("%s_%d", cookieName, count))
+		if err == nil {
+			cookies = append(cookies, c)
+			count++
+		}
+	}
+	if len(cookies) == 0 {
+		return nil, fmt.Errorf("Could not find cookie %s", cookieName)
+	}
+	return joinCookies(cookies)
 }

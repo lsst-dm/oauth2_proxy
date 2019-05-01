@@ -74,7 +74,7 @@ func main() {
 	flagSet.Duration("cookie-expire", time.Duration(168)*time.Hour, "expire timeframe for cookie")
 	flagSet.Duration("cookie-refresh", time.Duration(0), "refresh the cookie after this duration; 0 to disable")
 	flagSet.Bool("cookie-secure", true, "set secure (HTTPS) cookie flag")
-	flagSet.Bool("cookie-httponly", true, "set HttpOnly cookie flag")
+	flagSet.Bool("cookie-httponly", true, "set HTTPOnly cookie flag")
 
 	flagSet.String("logging-filename", "", "File to log requests to, empty for stdout")
 	flagSet.Int("logging-max-size", 100, "Maximum size in megabytes of the log file before rotation")

@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/alicebob/miniredis"
 	"github.com/go-redis/redis"
@@ -30,24 +31,33 @@ func TestRedisCookieStore(t *testing.T) {
 	testCipher, _ := NewCipher(secretString)
 
 	firstValue := "1234567890"
-	responseCookie := &http.Cookie{Value: firstValue}
 
-	store := &RedisCookieStore{
-		Client: client,
-		Block:  testCipher.Block,
-		Prefix: "oauth2_proxy",
+	cookieMaker := &Maker{
+		CookiePath:   "/",
+		CookieDomain: "",
+		HTTPOnly:     false,
+		Secure:       false,
 	}
 
+	store := &RedisCookieStore{
+		Client:     client,
+		Block:      testCipher.Block,
+		Maker:      cookieMaker,
+		CookieName: "_oauth2_proxy",
+	}
+
+	request, _ := http.NewRequest("GET", "http://localhost", nil)
+
 	// Test Store
-	ticket, err := store.Store(responseCookie, nil)
+	cookies, err := store.Store(request, firstValue, time.Hour, time.Now())
 	if err != nil {
 		t.Errorf("RedisCookieStore.Store() error = %v", err)
 		return
 	}
+	ticketCookie := cookies[0]
 
-	// Test Load
-	ticketCookie := &http.Cookie{Value: ticket}
-	loadedValue, err := store.Load(ticketCookie)
+	request.AddCookie(ticketCookie)
+	loadedValue, err := store.Load(request)
 	if err != nil {
 		t.Errorf("RedisCookieStore.Load() error = %v", err)
 		return
@@ -59,15 +69,16 @@ func TestRedisCookieStore(t *testing.T) {
 
 	// Test replacement
 	secondValue := "0987654321"
-	responseCookie = &http.Cookie{Value: secondValue}
 
-	_, err = store.Store(responseCookie, ticketCookie)
+	newCookies, err := store.Store(request, secondValue, time.Hour, time.Now())
 	if err != nil {
 		t.Errorf("RedisCookieStore.Store() error = %v", err)
 		return
 	}
+	newTicketCookie := newCookies[0]
+	assert.Equal(t, newTicketCookie.Value, ticketCookie.Value)
 
-	newLoadedValue, err := store.Load(ticketCookie)
+	newLoadedValue, err := store.Load(request)
 	if err != nil {
 		t.Errorf("RedisCookieStore.Load() error = %v", err)
 		return

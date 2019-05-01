@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
-	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -28,10 +27,6 @@ const (
 
 	httpScheme  = "http"
 	httpsScheme = "https"
-
-	// Cookies are limited to 4kb including the length of the cookie name,
-	// the cookie name can be up to 256 bytes
-	maxCookieLength = 3840
 
 	applicationJSON = "application/json"
 )
@@ -94,7 +89,8 @@ type OAuthProxy struct {
 	compiledRegex       []*regexp.Regexp
 	templates           *template.Template
 	Footer              string
-	CookiesStore        cookie.ServerCookiesStore
+	CookieStore         cookie.Store
+	CookieMaker         *cookie.Maker
 }
 
 // UpstreamProxy represents an upstream server to proxy to
@@ -228,10 +224,18 @@ func NewOAuthProxy(opts *Options, validator func(string) bool) *OAuthProxy {
 		}
 	}
 
-	var cookiesStore cookie.ServerCookiesStore
+	cookieMaker := &cookie.Maker{
+		CookiePath:   opts.CookiePath,
+		CookieDomain: opts.CookieDomain,
+		HTTPOnly:     opts.CookieHTTPOnly,
+		Secure:       opts.CookieSecure,
+	}
+
+	var cookiesStore cookie.Store
+	cookiesStore = &cookie.BrowserCookieStore{Maker: cookieMaker, CookieName: opts.CookieName}
 	if opts.RedisConnectionURL != "" {
 		var err error
-		cookiesStore, err = cookie.NewRedisCookieStore(opts.RedisConnectionURL, opts.CookieName, cipher.Block)
+		cookiesStore, err = cookie.NewRedisCookieStore(opts.RedisConnectionURL, opts.CookieName, cookieMaker, cipher.Block)
 		if err != nil {
 			logger.Fatal("redis-cookie-store: ", err)
 		}
@@ -278,7 +282,8 @@ func NewOAuthProxy(opts *Options, validator func(string) bool) *OAuthProxy {
 		CookieCipher:       cipher,
 		templates:          loadTemplates(opts.CustomTemplatesDir),
 		Footer:             opts.Footer,
-		CookiesStore:       cookiesStore,
+		CookieStore:        cookiesStore,
+		CookieMaker:        cookieMaker,
 	}
 }
 
@@ -335,143 +340,28 @@ func (p *OAuthProxy) MakeSessionCookie(req *http.Request, value string, expirati
 	if value != "" {
 		value = cookie.SignedValue(p.CookieSeed, p.CookieName, value, now)
 	}
-	c := p.makeCookie(req, p.CookieName, value, expiration, now)
-	if p.CookiesStore != nil {
-		// Proactively cleanup old cookies that might be hanging around
-		for _, requestCookie := range req.Cookies() {
-			if requestCookie.Name == p.CookieName {
-				_, err := p.CookiesStore.Clear(requestCookie)
-				if err != nil {
-					logger.Printf("Unable to clear cookies: %s", err)
-				}
+
+	// Proactively cleanup old cookies that might be hanging around
+	for _, requestCookie := range req.Cookies() {
+		if requestCookie.Name == p.CookieName {
+			_, err := p.CookieStore.Clear(requestCookie)
+			if err != nil {
+				logger.Printf("Unable to clear cookies: %s", err)
 			}
 		}
+	}
 
-		// Store new cookie. Pass the old cookie along just in case
-		requestCookie, _ := req.Cookie(p.CookieName)
-		newCookieValue, err := p.CookiesStore.Store(c, requestCookie)
-		if err != nil {
-			logger.Printf("Unable to load cookie: %s", err)
-		}
-		responseCookie := p.makeCookie(req, p.CookieName, newCookieValue, p.CookieExpire, now)
-		return []*http.Cookie{responseCookie}
-	}
-	if len(c.Value) > 4096-len(p.CookieName) {
-		return splitCookie(c)
-	}
-	return []*http.Cookie{c}
-}
-
-func copyCookie(c *http.Cookie) *http.Cookie {
-	return &http.Cookie{
-		Name:       c.Name,
-		Value:      c.Value,
-		Path:       c.Path,
-		Domain:     c.Domain,
-		Expires:    c.Expires,
-		RawExpires: c.RawExpires,
-		MaxAge:     c.MaxAge,
-		Secure:     c.Secure,
-		HttpOnly:   c.HttpOnly,
-		Raw:        c.Raw,
-		Unparsed:   c.Unparsed,
-	}
-}
-
-// splitCookie reads the full cookie generated to store the session and splits
-// it into a slice of cookies which fit within the 4kb cookie limit indexing
-// the cookies from 0
-func splitCookie(c *http.Cookie) []*http.Cookie {
-	if len(c.Value) < maxCookieLength {
-		return []*http.Cookie{c}
-	}
-	cookies := []*http.Cookie{}
-	valueBytes := []byte(c.Value)
-	count := 0
-	for len(valueBytes) > 0 {
-		new := copyCookie(c)
-		new.Name = fmt.Sprintf("%s_%d", c.Name, count)
-		count++
-		if len(valueBytes) < maxCookieLength {
-			new.Value = string(valueBytes)
-			valueBytes = []byte{}
-		} else {
-			newValue := valueBytes[:maxCookieLength]
-			valueBytes = valueBytes[maxCookieLength:]
-			new.Value = string(newValue)
-		}
-		cookies = append(cookies, new)
+	// Store new cookie. Pass the old cookie along just in case
+	cookies, err := p.CookieStore.Store(req, value, expiration, now)
+	if err != nil {
+		logger.Printf("Unable to load cookie: %s", err)
 	}
 	return cookies
 }
 
-// joinCookies takes a slice of cookies from the request and reconstructs the
-// full session cookie
-func joinCookies(cookies []*http.Cookie) (*http.Cookie, error) {
-	if len(cookies) == 0 {
-		return nil, fmt.Errorf("list of cookies must be > 0")
-	}
-	if len(cookies) == 1 {
-		return cookies[0], nil
-	}
-	c := copyCookie(cookies[0])
-	for i := 1; i < len(cookies); i++ {
-		c.Value += cookies[i].Value
-	}
-	c.Name = strings.TrimRight(c.Name, "_0")
-	return c, nil
-}
-
-// loadCookie retreieves the sessions state cookie from the http request.
-// If a single cookie is present this will be returned, otherwise it attempts
-// to reconstruct a cookie split up by splitCookie
-func loadCookie(req *http.Request, cookieName string) (*http.Cookie, error) {
-	c, err := req.Cookie(cookieName)
-	if err == nil {
-		return c, nil
-	}
-	cookies := []*http.Cookie{}
-	err = nil
-	count := 0
-	for err == nil {
-		var c *http.Cookie
-		c, err = req.Cookie(fmt.Sprintf("%s_%d", cookieName, count))
-		if err == nil {
-			cookies = append(cookies, c)
-			count++
-		}
-	}
-	if len(cookies) == 0 {
-		return nil, fmt.Errorf("Could not find cookie %s", cookieName)
-	}
-	return joinCookies(cookies)
-}
-
 // MakeCSRFCookie creates a cookie for CSRF
 func (p *OAuthProxy) MakeCSRFCookie(req *http.Request, value string, expiration time.Duration, now time.Time) *http.Cookie {
-	return p.makeCookie(req, p.CSRFCookieName, value, expiration, now)
-}
-
-func (p *OAuthProxy) makeCookie(req *http.Request, name string, value string, expiration time.Duration, now time.Time) *http.Cookie {
-	if p.CookieDomain != "" {
-		domain := req.Host
-		if h, _, err := net.SplitHostPort(domain); err == nil {
-			domain = h
-		}
-		if !strings.HasSuffix(domain, p.CookieDomain) {
-			logger.Printf("Warning: request host is %q but using configured cookie domain of %q", domain, p.CookieDomain)
-		}
-	}
-
-	return &http.Cookie{
-		Name:     name,
-		Value:    value,
-		Path:     p.CookiePath,
-		Domain:   p.CookieDomain,
-		HttpOnly: p.CookieHTTPOnly,
-		Secure:   p.CookieSecure,
-		Expires:  now.Add(expiration),
-	}
+	return p.CookieMaker.Make(req, p.CSRFCookieName, value, expiration, now)
 }
 
 // ClearCSRFCookie creates a cookie to unset the CSRF cookie stored in the user's
@@ -494,14 +384,14 @@ func (p *OAuthProxy) ClearSessionCookie(rw http.ResponseWriter, req *http.Reques
 	var cookieNameRegex = regexp.MustCompile(fmt.Sprintf("^%s(_\\d+)?$", p.CookieName))
 
 	for _, c := range req.Cookies() {
-		if p.CookiesStore != nil && c.Name == p.CookieName {
-			_, err := p.CookiesStore.Clear(c)
+		if p.CookieStore != nil && c.Name == p.CookieName {
+			_, err := p.CookieStore.Clear(c)
 			if err != nil {
 				logger.Printf("Unable to clear cookie: %s", err)
 			}
 		}
 		if cookieNameRegex.MatchString(c.Name) {
-			clearCookie := p.makeCookie(req, c.Name, "", time.Hour*-1, time.Now())
+			clearCookie := p.CookieMaker.Make(req, c.Name, "", time.Hour*-1, time.Now())
 
 			http.SetCookie(rw, clearCookie)
 			cookies = append(cookies, clearCookie)
@@ -526,21 +416,13 @@ func (p *OAuthProxy) SetSessionCookie(rw http.ResponseWriter, req *http.Request,
 // LoadCookiedSession reads the user's authentication details from the request
 func (p *OAuthProxy) LoadCookiedSession(req *http.Request) (*providers.SessionState, time.Duration, error) {
 	var age time.Duration
-	c, err := loadCookie(req, p.CookieName)
+	value, err := p.CookieStore.Load(req)
 	if err != nil {
 		// always http.ErrNoCookie
 		return nil, age, fmt.Errorf("Cookie %q not present", p.CookieName)
 	}
 
-	if p.CookiesStore != nil {
-		// If using a cookie store, load the actual value
-		c.Value, err = p.CookiesStore.Load(c)
-		if err != nil {
-			return nil, age, fmt.Errorf("Unable to load cookie: %s", err)
-		}
-	}
-
-	val, timestamp, err := cookie.Validate(c, p.CookieSeed, p.CookieExpire)
+	val, timestamp, err := cookie.Validate(p.CookieName, value, p.CookieSeed, p.CookieExpire)
 	if err != nil {
 		return nil, age, errors.New("Cookie Signature not valid")
 	}

@@ -9,22 +9,56 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/pusher/oauth2_proxy/logger"
 )
 
 // cookies are stored in a 3 part (value + timestamp + signature) to enforce that the values are as originally set.
 // additionally, the 'value' is encrypted so it's opaque to the browser
 
+// Maker helps make cookies in the store and the proxy
+type Maker struct {
+	CookiePath   string
+	CookieDomain string
+	HTTPOnly     bool
+	Secure       bool
+}
+
+// Make a cookie
+func (p *Maker) Make(req *http.Request, name string, value string, expiration time.Duration, now time.Time) *http.Cookie {
+	if p.CookieDomain != "" {
+		domain := req.Host
+		if h, _, err := net.SplitHostPort(domain); err == nil {
+			domain = h
+		}
+		if !strings.HasSuffix(domain, p.CookieDomain) {
+			logger.Printf("Warning: request host is %q but using configured cookie domain of %q", domain, p.CookieDomain)
+		}
+	}
+
+	return &http.Cookie{
+		Name:     name,
+		Value:    value,
+		Path:     p.CookiePath,
+		Domain:   p.CookieDomain,
+		HttpOnly: p.HTTPOnly,
+		Secure:   p.Secure,
+		Expires:  now.Add(expiration),
+	}
+}
+
 // Validate ensures a cookie is properly signed
-func Validate(cookie *http.Cookie, seed string, expiration time.Duration) (value string, t time.Time, err error) {
-	parts := strings.Split(cookie.Value, "|")
+func Validate(cookieName string, encodedValue string, seed string, expiration time.Duration) (value string, t time.Time, err error) {
+	parts := strings.Split(encodedValue, "|")
 	if len(parts) != 3 {
 		return value, t, fmt.Errorf("not enough parts in cookie")
 	}
-	sig := cookieSignature(seed, cookie.Name, parts[0], parts[1])
+	sig := cookieSignature(seed, cookieName, parts[0], parts[1])
 	if checkHmac(parts[2], sig) {
 		ts, err := strconv.Atoi(parts[1])
 		if err != nil {
