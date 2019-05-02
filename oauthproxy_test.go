@@ -1067,9 +1067,8 @@ func TestAjaxForbiddendRequest(t *testing.T) {
 }
 
 func TestClearSplitCookie(t *testing.T) {
-	maker := cookie.Maker{}
-	store := &cookie.BrowserCookieStore{Maker: &maker, CookieName: "oauth2"}
-	p := OAuthProxy{CookieName: "oauth2", CookieDomain: "abc", CookieStore: store, CookieMaker: &maker}
+	store := &cookie.BrowserCookieStore{CookieName: "oauth2"}
+	p := OAuthProxy{CookieName: "oauth2", CookieDomain: "abc", CookieStore: store}
 	var rw = httptest.NewRecorder()
 	req := httptest.NewRequest("get", "/", nil)
 
@@ -1093,9 +1092,8 @@ func TestClearSplitCookie(t *testing.T) {
 }
 
 func TestClearSingleCookie(t *testing.T) {
-	maker := cookie.Maker{}
-	store := &cookie.BrowserCookieStore{Maker: &maker, CookieName: "oauth2"}
-	p := OAuthProxy{CookieName: "oauth2", CookieDomain: "abc", CookieStore: store, CookieMaker: &maker}
+	store := &cookie.BrowserCookieStore{CookieName: "oauth2"}
+	p := OAuthProxy{CookieName: "oauth2", CookieDomain: "abc", CookieStore: store}
 	var rw = httptest.NewRecorder()
 	req := httptest.NewRequest("get", "/", nil)
 

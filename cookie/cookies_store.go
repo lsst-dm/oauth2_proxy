@@ -4,7 +4,6 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
-	"crypto/sha1"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
@@ -24,9 +23,9 @@ const (
 
 // Store is the interface to storing cookies.
 type Store interface {
-	Store(request *http.Request, value string, expiration time.Duration, now time.Time) ([]*http.Cookie, error)
-	Clear(requestCookie *http.Cookie) (bool, error)
+	Store(requestCookie *http.Cookie, value string, expires time.Time, cookieMaker func(string) *http.Cookie) ([]*http.Cookie, error)
 	Load(request *http.Request) (string, error)
+	Clear(requestCookie *http.Cookie) (bool, error)
 }
 
 // RedisCookieStore is an Redis-backed implementation of a Store.
@@ -35,19 +34,17 @@ type Store interface {
 type RedisCookieStore struct {
 	Client     *redis.Client
 	Block      cipher.Block
-	Maker      *Maker
 	CookieName string
 }
 
 // BrowserCookieStore is the traditional cookie store that creates the default cookies
 type BrowserCookieStore struct {
-	Maker      *Maker
 	CookieName string
 }
 
 // Store returns cookies to send back to the user.
-func (store *BrowserCookieStore) Store(request *http.Request, value string, expiration time.Duration, now time.Time) ([]*http.Cookie, error) {
-	c := store.Maker.Make(request, store.CookieName, value, expiration, now)
+func (store *BrowserCookieStore) Store(requestCookie *http.Cookie, value string, expires time.Time, cookieMaker func(string) *http.Cookie) ([]*http.Cookie, error) {
+	c := cookieMaker(value)
 	if len(c.Value) > 4096-len(store.CookieName) {
 		return splitCookie(c), nil
 	}
@@ -69,7 +66,7 @@ func (store *BrowserCookieStore) Load(request *http.Request) (string, error) {
 }
 
 // NewRedisCookieStore constructs a new Redis-backed Server cookie store.
-func NewRedisCookieStore(url string, cookieName string, cookieMaker *Maker, block cipher.Block) (*RedisCookieStore, error) {
+func NewRedisCookieStore(url string, cookieName string, block cipher.Block) (Store, error) {
 	opt, err := redis.ParseURL(url)
 	if err != nil {
 		panic(err)
@@ -79,7 +76,6 @@ func NewRedisCookieStore(url string, cookieName string, cookieMaker *Maker, bloc
 
 	rs := &RedisCookieStore{
 		Client:     client,
-		Maker:      cookieMaker,
 		Block:      block,
 		CookieName: cookieName,
 	}
@@ -89,10 +85,9 @@ func NewRedisCookieStore(url string, cookieName string, cookieMaker *Maker, bloc
 
 // Store stores the cookie locally and returns a new response cookie value to be
 // sent back to the client. That value is used to lookup the cookie later.
-func (store *RedisCookieStore) Store(request *http.Request, value string, expiration time.Duration, now time.Time) ([]*http.Cookie, error) {
+func (store *RedisCookieStore) Store(requestCookie *http.Cookie, value string, expires time.Time, cookieMaker func(string) *http.Cookie) ([]*http.Cookie, error) {
 	var cookieHandle string
 	var iv []byte
-	requestCookie, _ := request.Cookie(store.CookieName)
 	if requestCookie != nil {
 		var err error
 		cookieHandle, iv, err = parseCookieTicket(store.CookieName, requestCookie.Value)
@@ -100,9 +95,12 @@ func (store *RedisCookieStore) Store(request *http.Request, value string, expira
 			return nil, err
 		}
 	} else {
-		hasher := sha1.New()
-		hasher.Write([]byte(value))
-		cookieID := fmt.Sprintf("%x", hasher.Sum(nil))
+		cookieIDBytes := make([]byte, 16)
+		if _, err := io.ReadFull(rand.Reader, cookieIDBytes); err != nil {
+			return nil, fmt.Errorf("failed to create initialization vector %s", err)
+		}
+		cookieID := fmt.Sprintf("%x", cookieIDBytes)
+
 		iv = make([]byte, aes.BlockSize)
 		if _, err := io.ReadFull(rand.Reader, iv); err != nil {
 			return nil, fmt.Errorf("failed to create initialization vector %s", err)
@@ -114,6 +112,7 @@ func (store *RedisCookieStore) Store(request *http.Request, value string, expira
 	stream := cipher.NewCFBEncrypter(store.Block, iv)
 	stream.XORKeyStream(ciphertext, []byte(value))
 
+	expiration := expires.Sub(time.Now())
 	err := store.Client.Set(cookieHandle, ciphertext, expiration).Err()
 	if err != nil {
 		return nil, err
@@ -121,7 +120,7 @@ func (store *RedisCookieStore) Store(request *http.Request, value string, expira
 
 	cookieTicket := cookieHandle + "." + base64.RawURLEncoding.EncodeToString(iv)
 	if requestCookie == nil {
-		responseCookie := store.Maker.Make(request, store.CookieName, cookieTicket, expiration, now)
+		responseCookie := cookieMaker(cookieTicket)
 		return []*http.Cookie{responseCookie}, nil
 	}
 	return nil, nil

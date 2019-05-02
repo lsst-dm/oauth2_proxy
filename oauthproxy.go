@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -90,7 +91,6 @@ type OAuthProxy struct {
 	templates           *template.Template
 	Footer              string
 	CookieStore         cookie.Store
-	CookieMaker         *cookie.Maker
 }
 
 // UpstreamProxy represents an upstream server to proxy to
@@ -224,18 +224,11 @@ func NewOAuthProxy(opts *Options, validator func(string) bool) *OAuthProxy {
 		}
 	}
 
-	cookieMaker := &cookie.Maker{
-		CookiePath:   opts.CookiePath,
-		CookieDomain: opts.CookieDomain,
-		HTTPOnly:     opts.CookieHTTPOnly,
-		Secure:       opts.CookieSecure,
-	}
-
 	var cookiesStore cookie.Store
-	cookiesStore = &cookie.BrowserCookieStore{Maker: cookieMaker, CookieName: opts.CookieName}
+	cookiesStore = &cookie.BrowserCookieStore{CookieName: opts.CookieName}
 	if opts.RedisConnectionURL != "" {
 		var err error
-		cookiesStore, err = cookie.NewRedisCookieStore(opts.RedisConnectionURL, opts.CookieName, cookieMaker, cipher.Block)
+		cookiesStore, err = cookie.NewRedisCookieStore(opts.RedisConnectionURL, opts.CookieName, cipher.Block)
 		if err != nil {
 			logger.Fatal("redis-cookie-store: ", err)
 		}
@@ -283,7 +276,6 @@ func NewOAuthProxy(opts *Options, validator func(string) bool) *OAuthProxy {
 		templates:          loadTemplates(opts.CustomTemplatesDir),
 		Footer:             opts.Footer,
 		CookieStore:        cookiesStore,
-		CookieMaker:        cookieMaker,
 	}
 }
 
@@ -351,8 +343,9 @@ func (p *OAuthProxy) MakeSessionCookie(req *http.Request, value string, expirati
 		}
 	}
 
+	requestCookie, _ := req.Cookie(p.CookieName)
 	// Store new cookie. Pass the old cookie along just in case
-	cookies, err := p.CookieStore.Store(req, value, expiration, now)
+	cookies, err := p.CookieStore.Store(requestCookie, value, now.Add(expiration), p.cookieMaker(req, expiration, now))
 	if err != nil {
 		logger.Printf("Unable to load cookie: %s", err)
 	}
@@ -361,7 +354,35 @@ func (p *OAuthProxy) MakeSessionCookie(req *http.Request, value string, expirati
 
 // MakeCSRFCookie creates a cookie for CSRF
 func (p *OAuthProxy) MakeCSRFCookie(req *http.Request, value string, expiration time.Duration, now time.Time) *http.Cookie {
-	return p.CookieMaker.Make(req, p.CSRFCookieName, value, expiration, now)
+	return p.makeCookie(req, p.CSRFCookieName, value, expiration, now)
+}
+
+func (p *OAuthProxy) cookieMaker(req *http.Request, expiration time.Duration, now time.Time) func(string) *http.Cookie {
+	return func(value string) *http.Cookie {
+		return p.makeCookie(req, p.CookieName, value, expiration, now)
+	}
+}
+
+func (p *OAuthProxy) makeCookie(req *http.Request, name string, value string, expiration time.Duration, now time.Time) *http.Cookie {
+	if p.CookieDomain != "" {
+		domain := req.Host
+		if h, _, err := net.SplitHostPort(domain); err == nil {
+			domain = h
+		}
+		if !strings.HasSuffix(domain, p.CookieDomain) {
+			logger.Printf("Warning: request host is %q but using configured cookie domain of %q", domain, p.CookieDomain)
+		}
+	}
+
+	return &http.Cookie{
+		Name:     name,
+		Value:    value,
+		Path:     p.CookiePath,
+		Domain:   p.CookieDomain,
+		HttpOnly: p.CookieHTTPOnly,
+		Secure:   p.CookieSecure,
+		Expires:  now.Add(expiration),
+	}
 }
 
 // ClearCSRFCookie creates a cookie to unset the CSRF cookie stored in the user's
@@ -391,7 +412,7 @@ func (p *OAuthProxy) ClearSessionCookie(rw http.ResponseWriter, req *http.Reques
 			}
 		}
 		if cookieNameRegex.MatchString(c.Name) {
-			clearCookie := p.CookieMaker.Make(req, c.Name, "", time.Hour*-1, time.Now())
+			clearCookie := p.makeCookie(req, c.Name, "", time.Hour*-1, time.Now())
 
 			http.SetCookie(rw, clearCookie)
 			cookies = append(cookies, clearCookie)

@@ -32,24 +32,20 @@ func TestRedisCookieStore(t *testing.T) {
 
 	firstValue := "1234567890"
 
-	cookieMaker := &Maker{
-		CookiePath:   "/",
-		CookieDomain: "",
-		HTTPOnly:     false,
-		Secure:       false,
-	}
-
 	store := &RedisCookieStore{
 		Client:     client,
 		Block:      testCipher.Block,
-		Maker:      cookieMaker,
 		CookieName: "_oauth2_proxy",
 	}
 
 	request, _ := http.NewRequest("GET", "http://localhost", nil)
+	expires := time.Now().Add(time.Hour)
+	cookieMaker := func(value string) *http.Cookie {
+		return &http.Cookie{Name: "_oauth2_proxy", Value: value, Expires: expires}
+	}
 
 	// Test Store
-	cookies, err := store.Store(request, firstValue, time.Hour, time.Now())
+	cookies, err := store.Store(nil, firstValue, expires, cookieMaker)
 	if err != nil {
 		t.Errorf("RedisCookieStore.Store() error = %v", err)
 		return
@@ -70,13 +66,14 @@ func TestRedisCookieStore(t *testing.T) {
 	// Test replacement
 	secondValue := "0987654321"
 
-	newCookies, err := store.Store(request, secondValue, time.Hour, time.Now())
+	newCookies, err := store.Store(ticketCookie, secondValue, expires, cookieMaker)
 	if err != nil {
 		t.Errorf("RedisCookieStore.Store() error = %v", err)
 		return
 	}
-	newTicketCookie := newCookies[0]
-	assert.Equal(t, newTicketCookie.Value, ticketCookie.Value)
+
+	// No new cookies to put out
+	assert.Equal(t, len(newCookies), 0)
 
 	newLoadedValue, err := store.Load(request)
 	if err != nil {
