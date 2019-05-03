@@ -1129,7 +1129,7 @@ func (p *OAuthProxy) findBearerToken(req *http.Request) (string, error) {
 	}
 	jwtRegex := regexp.MustCompile(`^eyJ[a-zA-Z0-9_-]*\.eyJ[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]+$`)
 	var rawBearerToken string
-	if s[0] == "Bearer" && jwtRegex.MatchString(s[1]) {
+	if s[0] == "Bearer" && (jwtRegex.MatchString(s[1]) || strings.HasPrefix(s[1], p.CookieName)) {
 		rawBearerToken = s[1]
 	} else if s[0] == "Basic" {
 		// Check if we have a Bearer token masquerading in Basic
