@@ -16,6 +16,7 @@ import (
 
 	oidc "github.com/coreos/go-oidc"
 	"github.com/dgrijalva/jwt-go"
+	"github.com/go-redis/redis"
 	"github.com/mbland/hmacauth"
 	"github.com/pusher/oauth2_proxy/logger"
 	"github.com/pusher/oauth2_proxy/providers"
@@ -44,6 +45,7 @@ type Options struct {
 	GoogleGroups             []string `flag:"google-group" cfg:"google_group" env:"OAUTH2_PROXY_GOOGLE_GROUPS"`
 	GoogleAdminEmail         string   `flag:"google-admin-email" cfg:"google_admin_email" env:"OAUTH2_PROXY_GOOGLE_ADMIN_EMAIL"`
 	GoogleServiceAccountJSON string   `flag:"google-service-account-json" cfg:"google_service_account_json" env:"OAUTH2_PROXY_GOOGLE_SERVICE_ACCOUNT_JSON"`
+	RedisConnectionURL       string   `flag:"redis-connection-url" cfg:"redis_connection_url"`
 	HtpasswdFile             string   `flag:"htpasswd-file" cfg:"htpasswd_file" env:"OAUTH2_PROXY_HTPASSWD_FILE"`
 	DisplayHtpasswdForm      bool     `flag:"display-htpasswd-form" cfg:"display_htpasswd_form" env:"OAUTH2_PROXY_DISPLAY_HTPASSWD_FORM"`
 	CustomTemplatesDir       string   `flag:"custom-templates-dir" cfg:"custom_templates_dir" env:"OAUTH2_PROXY_CUSTOM_TEMPLATES_DIR"`
@@ -60,6 +62,8 @@ type Options struct {
 
 	Upstreams             []string      `flag:"upstream" cfg:"upstreams" env:"OAUTH2_PROXY_UPSTREAMS"`
 	SkipAuthRegex         []string      `flag:"skip-auth-regex" cfg:"skip_auth_regex" env:"OAUTH2_PROXY_SKIP_AUTH_REGEX"`
+	SkipJwtBearerTokens   bool          `flag:"skip-jwt-bearer-tokens" cfg:"skip_jwt_bearer_tokens" env:"OAUTH2_PROXY_SKIP_JWT_BEARER_TOKENS"`
+	ExtraJwtIssuers       []string      `flag:"extra-jwt-issuers" cfg:"extra_jwt_issuers" env:"OAUTH2_PROXY_EXTRA_JWT_ISSUERS"`
 	PassBasicAuth         bool          `flag:"pass-basic-auth" cfg:"pass_basic_auth" env:"OAUTH2_PROXY_PASS_BASIC_AUTH"`
 	BasicAuthPassword     string        `flag:"basic-auth-password" cfg:"basic_auth_password" env:"OAUTH2_PROXY_BASIC_AUTH_PASSWORD"`
 	PassAccessToken       bool          `flag:"pass-access-token" cfg:"pass_access_token" env:"OAUTH2_PROXY_PASS_ACCESS_TOKEN"`
@@ -109,12 +113,13 @@ type Options struct {
 	GCPHealthChecks bool   `flag:"gcp-healthchecks" cfg:"gcp_healthchecks" env:"OAUTH2_PROXY_GCP_HEALTHCHECKS"`
 
 	// internal values that are set after config validation
-	redirectURL   *url.URL
-	proxyURLs     []*url.URL
-	CompiledRegex []*regexp.Regexp
-	provider      providers.Provider
-	signatureData *SignatureData
-	oidcVerifier  *oidc.IDTokenVerifier
+	redirectURL        *url.URL
+	proxyURLs          []*url.URL
+	CompiledRegex      []*regexp.Regexp
+	provider           providers.Provider
+	signatureData      *SignatureData
+	oidcVerifier       *oidc.IDTokenVerifier
+	jwtBearerVerifiers []*oidc.IDTokenVerifier
 }
 
 // SignatureData holds hmacauth signature hash and key
@@ -159,6 +164,12 @@ func NewOptions() *Options {
 		AuthLogging:           true,
 		AuthLoggingFormat:     logger.DefaultAuthLoggingFormat,
 	}
+}
+
+// JwtIssuer hold parsed JWT issuer info that's used to construct a verifier.
+type JwtIssuer struct {
+	issuerURI string
+	audience  string
 }
 
 func parseURL(toParse string, urltype string, msgs []string) (*url.URL, []string) {
@@ -237,6 +248,25 @@ func (o *Options) Validate() error {
 		}
 	}
 
+	if o.SkipJwtBearerTokens {
+		// If we are using an oidc provider, go ahead and add that provider to the list
+		if o.oidcVerifier != nil {
+			o.jwtBearerVerifiers = append(o.jwtBearerVerifiers, o.oidcVerifier)
+		}
+		// Configure extra issuers
+		if len(o.ExtraJwtIssuers) > 0 {
+			var jwtIssuers []JwtIssuer
+			jwtIssuers, msgs = parseJwtIssuers(o.ExtraJwtIssuers, msgs)
+			for _, jwtIssuer := range jwtIssuers {
+				verifier, err := newVerifierFromJwtIssuer(jwtIssuer)
+				if err != nil {
+					msgs = append(msgs, fmt.Sprintf("error building verifiers: %s", err))
+				}
+				o.jwtBearerVerifiers = append(o.jwtBearerVerifiers, verifier)
+			}
+		}
+	}
+
 	o.redirectURL, msgs = parseURL(o.RedirectURL, "redirect", msgs)
 
 	for _, u := range o.Upstreams {
@@ -283,6 +313,13 @@ func (o *Options) Validate() error {
 					"pass_access_token == true or "+
 					"cookie_refresh != 0, but is %d bytes.%s",
 				len(secretBytes(o.CookieSecret)), suffix))
+		}
+	}
+
+	if o.RedisConnectionURL != "" {
+		_, err := redis.ParseURL(o.RedisConnectionURL)
+		if err != nil {
+			msgs = append(msgs, fmt.Sprintf("unable to parse redis url: %s", err))
 		}
 	}
 
@@ -406,6 +443,45 @@ func parseSignatureKey(o *Options, msgs []string) []string {
 	}
 	o.signatureData = &SignatureData{hash, secretKey}
 	return msgs
+}
+
+// parseJwtIssuers takes in an array of strings in the form of issuer=audience
+// and parses to an array of JwtIssuer structs.
+func parseJwtIssuers(issuers []string, msgs []string) ([]JwtIssuer, []string) {
+	var parsedIssuers []JwtIssuer
+	for _, jwtVerifier := range issuers {
+		components := strings.Split(jwtVerifier, "=")
+		if len(components) < 2 {
+			msgs = append(msgs, fmt.Sprintf("invalid jwt verifier uri=audience spec: %s", jwtVerifier))
+			continue
+		}
+		uri, audience := components[0], strings.Join(components[1:], "=")
+		parsedIssuers = append(parsedIssuers, JwtIssuer{issuerURI: uri, audience: audience})
+	}
+	return parsedIssuers, msgs
+}
+
+// newVerifierFromJwtIssuer takes in issuer information in JwtIssuer info and returns
+// a verifier for that issuer.
+func newVerifierFromJwtIssuer(jwtIssuer JwtIssuer) (*oidc.IDTokenVerifier, error) {
+	config := &oidc.Config{
+		ClientID: jwtIssuer.audience,
+	}
+	// Try as an OpenID Connect Provider first
+	var verifier *oidc.IDTokenVerifier
+	provider, err := oidc.NewProvider(context.Background(), jwtIssuer.issuerURI)
+	if err != nil {
+		// Try as JWKS URI
+		jwksURI := strings.TrimSuffix(jwtIssuer.issuerURI, "/") + "/.well-known/jwks.json"
+		_, err := http.NewRequest("GET", jwksURI, nil)
+		if err != nil {
+			return nil, err
+		}
+		verifier = oidc.NewVerifier(jwtIssuer.issuerURI, oidc.NewRemoteKeySet(context.Background(), jwksURI), config)
+	} else {
+		verifier = provider.Verifier(config)
+	}
+	return verifier, nil
 }
 
 func validateCookieName(o *Options, msgs []string) []string {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	b64 "encoding/base64"
 	"errors"
 	"fmt"
@@ -13,6 +14,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/coreos/go-oidc"
+	"github.com/go-redis/redis"
 	"github.com/mbland/hmacauth"
 	"github.com/pusher/oauth2_proxy/cookie"
 	"github.com/pusher/oauth2_proxy/logger"
@@ -90,9 +93,12 @@ type OAuthProxy struct {
 	CookieCipher        *cookie.Cipher
 	skipAuthRegex       []string
 	skipAuthPreflight   bool
+	skipJwtBearerTokens bool
+	jwtBearerVerifiers  []*oidc.IDTokenVerifier
 	compiledRegex       []*regexp.Regexp
 	templates           *template.Template
 	Footer              string
+	CookiesStore        cookie.ServerCookiesStore
 }
 
 // UpstreamProxy represents an upstream server to proxy to
@@ -204,6 +210,12 @@ func NewOAuthProxy(opts *Options, validator func(string) bool) *OAuthProxy {
 		logger.Printf("compiled skip-auth-regex => %q", u)
 	}
 
+	if opts.SkipJwtBearerTokens {
+		logger.Printf("Skipping JWT tokens from configured OIDC issuer: %q", opts.OIDCIssuerURL)
+		for _, issuer := range opts.ExtraJwtIssuers {
+			logger.Printf("Skipping JWT tokens from extra JWT issuer: %q", issuer)
+		}
+	}
 	redirectURL := opts.redirectURL
 	if redirectURL.Path == "" {
 		redirectURL.Path = fmt.Sprintf("%s/callback", opts.ProxyPrefix)
@@ -226,6 +238,17 @@ func NewOAuthProxy(opts *Options, validator func(string) bool) *OAuthProxy {
 		}
 	}
 
+	var cookiesStore cookie.ServerCookiesStore
+	if opts.RedisConnectionURL != "" {
+		var err error
+		cookiesStore, err = cookie.NewRedisCookieStore(opts.RedisConnectionURL, opts.CookieName, cipher.Block)
+		if err != nil {
+			logger.Fatal("redis-cookie-store: ", err)
+		}
+		parsed, _ := redis.ParseURL(opts.RedisConnectionURL)
+		logger.Printf("Redis Cookie Store enabled at %v/%v, oauth2_proxy issuing cookie tickets", parsed.Addr, parsed.DB)
+	}
+
 	return &OAuthProxy{
 		CookieName:     opts.CookieName,
 		CSRFCookieName: fmt.Sprintf("%v_%v", opts.CookieName, "csrf"),
@@ -246,25 +269,28 @@ func NewOAuthProxy(opts *Options, validator func(string) bool) *OAuthProxy {
 		OAuthCallbackPath: fmt.Sprintf("%s/callback", opts.ProxyPrefix),
 		AuthOnlyPath:      fmt.Sprintf("%s/auth", opts.ProxyPrefix),
 
-		ProxyPrefix:        opts.ProxyPrefix,
-		provider:           opts.provider,
-		serveMux:           serveMux,
-		redirectURL:        redirectURL,
-		whitelistDomains:   opts.WhitelistDomains,
-		skipAuthRegex:      opts.SkipAuthRegex,
-		skipAuthPreflight:  opts.SkipAuthPreflight,
-		compiledRegex:      opts.CompiledRegex,
-		SetXAuthRequest:    opts.SetXAuthRequest,
-		PassBasicAuth:      opts.PassBasicAuth,
-		PassUserHeaders:    opts.PassUserHeaders,
-		BasicAuthPassword:  opts.BasicAuthPassword,
-		PassAccessToken:    opts.PassAccessToken,
-		SetAuthorization:   opts.SetAuthorization,
-		PassAuthorization:  opts.PassAuthorization,
-		SkipProviderButton: opts.SkipProviderButton,
-		CookieCipher:       cipher,
-		templates:          loadTemplates(opts.CustomTemplatesDir),
-		Footer:             opts.Footer,
+		ProxyPrefix:         opts.ProxyPrefix,
+		provider:            opts.provider,
+		serveMux:            serveMux,
+		redirectURL:         redirectURL,
+		whitelistDomains:    opts.WhitelistDomains,
+		skipAuthRegex:       opts.SkipAuthRegex,
+		skipAuthPreflight:   opts.SkipAuthPreflight,
+		skipJwtBearerTokens: opts.SkipJwtBearerTokens,
+		jwtBearerVerifiers:  opts.jwtBearerVerifiers,
+		compiledRegex:       opts.CompiledRegex,
+		SetXAuthRequest:     opts.SetXAuthRequest,
+		PassBasicAuth:       opts.PassBasicAuth,
+		PassUserHeaders:     opts.PassUserHeaders,
+		BasicAuthPassword:   opts.BasicAuthPassword,
+		PassAccessToken:     opts.PassAccessToken,
+		SetAuthorization:    opts.SetAuthorization,
+		PassAuthorization:   opts.PassAuthorization,
+		SkipProviderButton:  opts.SkipProviderButton,
+		CookieCipher:        cipher,
+		templates:           loadTemplates(opts.CustomTemplatesDir),
+		Footer:              opts.Footer,
+		CookiesStore:        cookiesStore,
 	}
 }
 
@@ -322,6 +348,26 @@ func (p *OAuthProxy) MakeSessionCookie(req *http.Request, value string, expirati
 		value = cookie.SignedValue(p.CookieSeed, p.CookieName, value, now)
 	}
 	c := p.makeCookie(req, p.CookieName, value, expiration, now)
+	if p.CookiesStore != nil {
+		// Proactively cleanup old cookies that might be hanging around
+		for _, requestCookie := range req.Cookies() {
+			if requestCookie.Name == p.CookieName {
+				_, err := p.CookiesStore.Clear(requestCookie)
+				if err != nil {
+					logger.Printf("Unable to clear cookies: %s", err)
+				}
+			}
+		}
+
+		// Store new cookie. Pass the old cookie along just in case
+		requestCookie, _ := req.Cookie(p.CookieName)
+		newCookieValue, err := p.CookiesStore.Store(c, requestCookie)
+		if err != nil {
+			logger.Printf("Unable to load cookie: %s", err)
+		}
+		responseCookie := p.makeCookie(req, p.CookieName, newCookieValue, p.CookieExpire, now)
+		return []*http.Cookie{responseCookie}
+	}
 	if len(c.Value) > 4096-len(p.CookieName) {
 		return splitCookie(c)
 	}
@@ -460,6 +506,12 @@ func (p *OAuthProxy) ClearSessionCookie(rw http.ResponseWriter, req *http.Reques
 	var cookieNameRegex = regexp.MustCompile(fmt.Sprintf("^%s(_\\d+)?$", p.CookieName))
 
 	for _, c := range req.Cookies() {
+		if p.CookiesStore != nil && c.Name == p.CookieName {
+			_, err := p.CookiesStore.Clear(c)
+			if err != nil {
+				logger.Printf("Unable to clear cookie: %s", err)
+			}
+		}
 		if cookieNameRegex.MatchString(c.Name) {
 			clearCookie := p.makeCookie(req, c.Name, "", time.Hour*-1, time.Now())
 
@@ -491,8 +543,17 @@ func (p *OAuthProxy) LoadCookiedSession(req *http.Request) (*providers.SessionSt
 		// always http.ErrNoCookie
 		return nil, age, fmt.Errorf("Cookie %q not present", p.CookieName)
 	}
-	val, timestamp, ok := cookie.Validate(c, p.CookieSeed, p.CookieExpire)
-	if !ok {
+
+	if p.CookiesStore != nil {
+		// If using a cookie store, load the actual value
+		c.Value, err = p.CookiesStore.Load(c)
+		if err != nil {
+			return nil, age, fmt.Errorf("Unable to load cookie: %s", err)
+		}
+	}
+
+	val, timestamp, err := cookie.Validate(c, p.CookieSeed, p.CookieExpire)
+	if err != nil {
 		return nil, age, errors.New("Cookie Signature not valid")
 	}
 
@@ -829,26 +890,43 @@ func (p *OAuthProxy) Proxy(rw http.ResponseWriter, req *http.Request) {
 
 // Authenticate checks whether a user is authenticated
 func (p *OAuthProxy) Authenticate(rw http.ResponseWriter, req *http.Request) int {
+	var session *providers.SessionState
+	var err error
 	var saveSession, clearSession, revalidated bool
+
+	if p.skipJwtBearerTokens && req.Header.Get("Authorization") != "" {
+		session, err = p.GetJwtSession(req)
+		if err != nil {
+			logger.Printf("Error retrieving session from token in Authorization header: %s", err)
+		}
+		if session != nil {
+			saveSession = false
+		}
+	}
+
 	remoteAddr := getRemoteAddr(req)
-
-	session, sessionAge, err := p.LoadCookiedSession(req)
-	if err != nil {
-		logger.Printf("Error loading cookied session: %s", err)
+	if session == nil {
+		var sessionAge time.Duration
+		session, sessionAge, err = p.LoadCookiedSession(req)
+		if err != nil {
+			logger.Printf("Error loading cookied session: %s", err)
+		}
+		if session != nil && sessionAge > p.CookieRefresh && p.CookieRefresh != time.Duration(0) {
+			logger.Printf("Refreshing %s old session cookie for %s (refresh after %s)", sessionAge, session, p.CookieRefresh)
+			saveSession = true
+		}
 	}
-	if session != nil && sessionAge > p.CookieRefresh && p.CookieRefresh != time.Duration(0) {
-		logger.Printf("Refreshing %s old session cookie for %s (refresh after %s)", sessionAge, session, p.CookieRefresh)
-		saveSession = true
-	}
 
-	var ok bool
-	if ok, err = p.provider.RefreshSessionIfNeeded(session); err != nil {
-		logger.Printf("%s removing session. error refreshing access token %s %s", remoteAddr, err, session)
-		clearSession = true
-		session = nil
-	} else if ok {
-		saveSession = true
-		revalidated = true
+	if session != nil {
+		var ok bool
+		if ok, err = p.provider.RefreshSessionIfNeeded(session); err != nil {
+			logger.Printf("%s removing session. error refreshing access token %s %s", remoteAddr, err, session)
+			clearSession = true
+			session = nil
+		} else if ok {
+			saveSession = true
+			revalidated = true
+		}
 	}
 
 	if session != nil && session.IsExpired() {
@@ -991,4 +1069,120 @@ func (p *OAuthProxy) isAjax(req *http.Request) bool {
 func (p *OAuthProxy) ErrorJSON(rw http.ResponseWriter, code int) {
 	rw.Header().Set("Content-Type", applicationJSON)
 	rw.WriteHeader(code)
+}
+
+// GetJwtSession loads a session based on a JWT token in the authorization header.
+func (p *OAuthProxy) GetJwtSession(req *http.Request) (*providers.SessionState, error) {
+	rawBearerToken, err := p.findBearerToken(req)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx := context.Background()
+	var session *providers.SessionState
+	for _, verifier := range p.jwtBearerVerifiers {
+		bearerToken, err := verifier.Verify(ctx, rawBearerToken)
+
+		if err != nil {
+			logger.Printf("failed to verify bearer token: %v", err)
+			continue
+		}
+
+		var claims struct {
+			Subject  string `json:"sub"`
+			Email    string `json:"email"`
+			Verified *bool  `json:"email_verified"`
+		}
+
+		if err := bearerToken.Claims(&claims); err != nil {
+			return nil, fmt.Errorf("failed to parse bearer token claims: %v", err)
+		}
+
+		if claims.Email == "" {
+			claims.Email = claims.Subject
+		}
+
+		if claims.Verified != nil && !*claims.Verified {
+			return nil, fmt.Errorf("email in id_token (%s) isn't verified", claims.Email)
+		}
+		user := strings.Split(claims.Email, "@")[0]
+
+		session = &providers.SessionState{
+			AccessToken:  rawBearerToken,
+			IDToken:      rawBearerToken,
+			RefreshToken: "",
+			ExpiresOn:    bearerToken.Expiry,
+			Email:        claims.Email,
+			User:         user,
+		}
+		return session, nil
+	}
+	return nil, fmt.Errorf("unable to verify jwt token %s", req.Header.Get("Authorization"))
+}
+
+// findBearerToken finds a valid JWT token from the Authorization header of a given request.
+func (p *OAuthProxy) findBearerToken(req *http.Request) (string, error) {
+	auth := req.Header.Get("Authorization")
+	s := strings.SplitN(auth, " ", 2)
+	if len(s) != 2 {
+		return "", fmt.Errorf("invalid authorization header %s", auth)
+	}
+	jwtRegex := regexp.MustCompile(`^eyJ[a-zA-Z0-9_-]*\.eyJ[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]+$`)
+	var rawBearerToken string
+	if s[0] == "Bearer" && (jwtRegex.MatchString(s[1]) || strings.HasPrefix(s[1], p.CookieName)) {
+		rawBearerToken = s[1]
+	} else if s[0] == "Basic" {
+		// Check if we have a Bearer token masquerading in Basic
+		b, err := b64.StdEncoding.DecodeString(s[1])
+		if err != nil {
+			return "", err
+		}
+		pair := strings.SplitN(string(b), ":", 2)
+		if len(pair) != 2 {
+			return "", fmt.Errorf("invalid format %s", b)
+		}
+		user, password := pair[0], pair[1]
+
+		// check user, user+password, or just password for a token
+		if jwtRegex.MatchString(user) || strings.HasPrefix(user, p.CookieName) {
+			// Support blank passwords or magic `x-oauth-basic` passwords - nothing else
+			if password == "" || password == "x-oauth-basic" {
+				rawBearerToken = user
+			}
+		}
+		if jwtRegex.MatchString(password) || strings.HasPrefix(password, p.CookieName) {
+			// support passwords and ignore user
+			rawBearerToken = password
+		}
+	}
+	if rawBearerToken == "" {
+		return "", fmt.Errorf("no valid bearer token found in authorization header")
+	}
+
+	// Check if this is actually a session identifier
+	if p.CookiesStore != nil && strings.HasPrefix(rawBearerToken, p.CookieName) {
+		// Mock the header as a request cookie
+		c := &http.Cookie{Name: p.CookieName, Value: rawBearerToken}
+		signedSession, err := p.CookiesStore.Load(c)
+		if err != nil {
+			logger.Printf("error loading ticket from store: %v", err)
+		}
+		// Only proceed if we found a cookie in the cookie store
+		if err == nil {
+			c.Value = signedSession
+			serverSession, _, err := cookie.Validate(c, p.CookieSeed, p.CookieExpire)
+			if err != nil {
+				return "", fmt.Errorf("unable to validate cookie loaded from cookie store: %v", err)
+			}
+			session, err := providers.DecodeSessionState(serverSession, p.CookieCipher)
+			if err != nil {
+				return "", fmt.Errorf("unable to decode session from cookie store: %v", err)
+			}
+			rawBearerToken = session.IDToken
+		}
+	} else {
+		logger.Printf("not checking ticket: %s, prefix: %s", rawBearerToken, p.CookieName)
+	}
+
+	return rawBearerToken, nil
 }
