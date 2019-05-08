@@ -17,7 +17,9 @@ import (
 )
 
 // ServerCookiesStore is the interface to storing cookies.
-// It takes in cookies
+// It takes in cookies for Store and returns a handle as a string value,
+// It clears cookies in Clear based on the cookie value, extracting the handle
+// It takes in a cookie for Load, extracting the handle, and sends the value stored by Store
 type ServerCookiesStore interface {
 	Store(responseCookie *http.Cookie, requestCookie *http.Cookie) (string, error)
 	Clear(requestCookie *http.Cookie) (bool, error)
