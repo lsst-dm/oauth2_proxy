@@ -37,7 +37,7 @@ type RedisCookieStore struct {
 func NewRedisCookieStore(url string, cookieName string, block cipher.Block) (*RedisCookieStore, error) {
 	opt, err := redis.ParseURL(url)
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
 
 	client := redis.NewClient(opt)
@@ -47,12 +47,15 @@ func NewRedisCookieStore(url string, cookieName string, block cipher.Block) (*Re
 		Prefix: cookieName,
 		Block:  block,
 	}
-	// Create client as usually.
 	return rs, nil
 }
 
-// Store stores the cookie locally and returns a new response cookie value to be
-// sent back to the client. That value is used to lookup the cookie later.
+// Store accepts responseCookie, the cookie we were going to send to back to the client,
+// and requestCookie for the session, which might be nil. If requestCookie wasn't nil, we
+// use the handle from request cookie for storing the response cookie. This is because we
+// can store over a previously valid session if we refreshed the session. Once the cookie
+// is stored, return the new value for the cookie and we let the calling code modify
+// the responseCookie as it sees fit.
 func (store *RedisCookieStore) Store(responseCookie *http.Cookie, requestCookie *http.Cookie) (string, error) {
 	var cookieHandle string
 	var iv []byte
