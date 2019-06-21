@@ -1,7 +1,47 @@
 # Vx.x.x (Pre-release)
 
+## Breaking Changes
+
+- [#146](https://github.com/pusher/oauth2_proxy/pull/146) Use full email address as `User` if the auth response did not contain a `User` field (@gargath)
+  - This change modifies the contents of the `X-Forwarded-User` header supplied by the proxy for users where the auth response from the IdP did not contain
+    a username.
+    In that case, this header used to only contain the local part of the user's email address (e.g. `john.doe` for `john.doe@example.com`) but now contains
+    the user's full email address instead.
+- [#170](https://github.com/pusher/oauth2_proxy/pull/170) Pre-built binary tarballs changed format
+  - The pre-built binary tarballs again match the format of the [bitly](https://github.com/bitly/oauth2_proxy) repository, where the unpacked directory
+    has the same name as the tarball and the binary is always named `oauth2_proxy`. This was done to restore compatibility with third-party automation
+    recipes like https://github.com/jhoblitt/puppet-oauth2_proxy.
+
 ## Changes since v3.2.0
 
+- [#65](https://github.com/pusher/oauth2_proxy/pull/65) Improvements to authenticate requests with a JWT bearer token in the `Authorization` header via
+  the `-skip-jwt-bearer-token` options. 
+  - Additional verifiers can be configured via the `-extra-jwt-issuers` flag if the JWT issuers is either an OpenID provider or has a JWKS URL 
+  (e.g. `https://example.com/.well-known/jwks.json`).
+- [#180](https://github.com/pusher/outh2_proxy/pull/180) Minor refactor of core proxying path (@aeijdenberg).
+- [#175](https://github.com/pusher/outh2_proxy/pull/175) Bump go-oidc to v2.0.0 (@aeijdenberg).
+  - Includes fix for potential signature checking issue when OIDC discovery is skipped.
+- [#155](https://github.com/pusher/outh2_proxy/pull/155) Add RedisSessionStore implementation (@brianv0, @JoelSpeed)
+  - Implement flags to configure the redis session store
+    - `-session-store-type=redis` Sets the store type to redis
+    - `-redis-connection-url` Sets the Redis connection URL
+    - `-redis-use-sentinel=true` Enables Redis Sentinel support
+    - `-redis-sentinel-master-name` Sets the Sentinel master name, if sentinel is enabled
+    - `-redis-sentinel-connection-urls` Defines the Redis Sentinel Connection URLs, if sentinel is enabled
+  - Introduces the concept of a session ticket. Tickets are composed of the cookie name, a session ID, and a secret.
+  - Redis Sessions are stored encrypted with a per-session secret 
+  - Added tests for server based session stores
+- [#168](https://github.com/pusher/outh2_proxy/pull/168) Drop Go 1.11 support in Travis (@JoelSpeed)
+- [#169](https://github.com/pusher/outh2_proxy/pull/169) Update Alpine to 3.9 (@kskewes)
+- [#148](https://github.com/pusher/outh2_proxy/pull/148) Implement SessionStore interface within proxy (@JoelSpeed)
+- [#147](https://github.com/pusher/outh2_proxy/pull/147) Add SessionStore interfaces and initial implementation (@JoelSpeed)
+  - Allows for multiple different session storage implementations including client and server side
+  - Adds tests suite for interface to ensure consistency across implementations
+  - Refactor some configuration options (around cookies) into packages
+- [#114](https://github.com/pusher/oauth2_proxy/pull/114), [#154](https://github.com/pusher/oauth2_proxy/pull/154) Documentation is now available live at our [docs website](https://pusher.github.io/oauth2_proxy/) (@JoelSpeed, @icelynjennings)
+- [#146](https://github.com/pusher/oauth2_proxy/pull/146) Use full email address as `User` if the auth response did not contain a `User` field (@gargath)
+- [#144](https://github.com/pusher/oauth2_proxy/pull/144) Use GO 1.12 for ARM builds (@kskewes)
+- [#142](https://github.com/pusher/oauth2_proxy/pull/142) ARM Docker USER fix (@kskewes)
 - [#52](https://github.com/pusher/oauth2_proxy/pull/52) Logging Improvements (@MisterWil)
   - Implement flags to configure file logging
     - `-logging-filename` Defines the filename to log to
@@ -18,11 +58,11 @@
     - `-auth-logging-format` Sets the format for auth logging
 
 - [#111](https://github.com/pusher/oauth2_proxy/pull/111) Add option for telling where to find a login.gov JWT key file (@timothy-spencer)
-- [#65](https://github.com/pusher/oauth2_proxy/pull/65) Improvements to authenticate requests with a JWT bearer token in the `Authorization` header via
-  the `-skip-jwt-bearer-token` options. 
-  - Additional verifiers can be configured via the `-extra-jwt-issuers` flag if the JWT issuers is either an OpenID provider or has a JWKS URL 
-  (e.g. `https://example.com/.well-known/jwks.json`).
-  
+- [#170](https://github.com/pusher/oauth2_proxy/pull/170) Restore binary tarball contents to be compatible with bitlys original tarballs (@zeha)
+- [#185](https://github.com/pusher/oauth2_proxy/pull/185) Fix an unsupported protocol scheme error during token validation when using the Azure provider (@jonas)
+- [#141](https://github.com/pusher/oauth2_proxy/pull/141) Check google group membership based on email address (@bchess)
+  - Google Group membership is additionally checked via email address, allowing users outside a GSuite domain to be authorized.
+
 # v3.2.0
 
 ## Release highlights

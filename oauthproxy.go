@@ -15,10 +15,11 @@ import (
 	"time"
 
 	"github.com/coreos/go-oidc"
-	"github.com/go-redis/redis"
 	"github.com/mbland/hmacauth"
 	"github.com/pusher/oauth2_proxy/cookie"
 	"github.com/pusher/oauth2_proxy/logger"
+	sessionsapi "github.com/pusher/oauth2_proxy/pkg/apis/sessions"
+	"github.com/pusher/oauth2_proxy/pkg/sessions/redis"
 	"github.com/pusher/oauth2_proxy/providers"
 	"github.com/yhat/wsutil"
 )
@@ -30,10 +31,6 @@ const (
 
 	httpScheme  = "http"
 	httpsScheme = "https"
-
-	// Cookies are limited to 4kb including the length of the cookie name,
-	// the cookie name can be up to 256 bytes
-	maxCookieLength = 3840
 
 	applicationJSON = "application/json"
 )
@@ -52,6 +49,11 @@ var SignatureHeaders = []string{
 	"Cookie",
 	"Gap-Auth",
 }
+
+var (
+	// ErrNeedsLogin means the user should be redirected to the login page
+	ErrNeedsLogin = errors.New("redirect to login page")
+)
 
 // OAuthProxy is the main authentication proxy
 type OAuthProxy struct {
@@ -77,6 +79,7 @@ type OAuthProxy struct {
 	redirectURL         *url.URL // the url to receive requests at
 	whitelistDomains    []string
 	provider            providers.Provider
+	sessionStore        sessionsapi.SessionStore
 	ProxyPrefix         string
 	SignInMessage       string
 	HtpasswdFile        *HtpasswdFile
@@ -90,7 +93,6 @@ type OAuthProxy struct {
 	PassAccessToken     bool
 	SetAuthorization    bool
 	PassAuthorization   bool
-	CookieCipher        *cookie.Cipher
 	skipAuthRegex       []string
 	skipAuthPreflight   bool
 	skipJwtBearerTokens bool
@@ -98,7 +100,6 @@ type OAuthProxy struct {
 	compiledRegex       []*regexp.Regexp
 	templates           *template.Template
 	Footer              string
-	CookiesStore        cookie.ServerCookiesStore
 }
 
 // UpstreamProxy represents an upstream server to proxy to
@@ -229,26 +230,6 @@ func NewOAuthProxy(opts *Options, validator func(string) bool) *OAuthProxy {
 
 	logger.Printf("Cookie settings: name:%s secure(https):%v httponly:%v expiry:%s domain:%s path:%s refresh:%s", opts.CookieName, opts.CookieSecure, opts.CookieHTTPOnly, opts.CookieExpire, opts.CookieDomain, opts.CookiePath, refresh)
 
-	var cipher *cookie.Cipher
-	if opts.PassAccessToken || opts.SetAuthorization || opts.PassAuthorization || (opts.CookieRefresh != time.Duration(0)) {
-		var err error
-		cipher, err = cookie.NewCipher(secretBytes(opts.CookieSecret))
-		if err != nil {
-			logger.Fatal("cookie-secret error: ", err)
-		}
-	}
-
-	var cookiesStore cookie.ServerCookiesStore
-	if opts.RedisConnectionURL != "" {
-		var err error
-		cookiesStore, err = cookie.NewRedisCookieStore(opts.RedisConnectionURL, opts.CookieName, cipher.Block)
-		if err != nil {
-			logger.Fatal("redis-cookie-store: ", err)
-		}
-		parsed, _ := redis.ParseURL(opts.RedisConnectionURL)
-		logger.Printf("Redis Cookie Store enabled at %v/%v, oauth2_proxy issuing cookie tickets", parsed.Addr, parsed.DB)
-	}
-
 	return &OAuthProxy{
 		CookieName:     opts.CookieName,
 		CSRFCookieName: fmt.Sprintf("%v_%v", opts.CookieName, "csrf"),
@@ -271,6 +252,7 @@ func NewOAuthProxy(opts *Options, validator func(string) bool) *OAuthProxy {
 
 		ProxyPrefix:         opts.ProxyPrefix,
 		provider:            opts.provider,
+		sessionStore:        opts.sessionStore,
 		serveMux:            serveMux,
 		redirectURL:         redirectURL,
 		whitelistDomains:    opts.WhitelistDomains,
@@ -287,10 +269,8 @@ func NewOAuthProxy(opts *Options, validator func(string) bool) *OAuthProxy {
 		SetAuthorization:    opts.SetAuthorization,
 		PassAuthorization:   opts.PassAuthorization,
 		SkipProviderButton:  opts.SkipProviderButton,
-		CookieCipher:        cipher,
 		templates:           loadTemplates(opts.CustomTemplatesDir),
 		Footer:              opts.Footer,
-		CookiesStore:        cookiesStore,
 	}
 }
 
@@ -318,7 +298,7 @@ func (p *OAuthProxy) displayCustomLoginForm() bool {
 	return p.HtpasswdFile != nil && p.DisplayHtpasswdForm
 }
 
-func (p *OAuthProxy) redeemCode(host, code string) (s *providers.SessionState, err error) {
+func (p *OAuthProxy) redeemCode(host, code string) (s *sessionsapi.SessionState, err error) {
 	if code == "" {
 		return nil, errors.New("missing code")
 	}
@@ -339,124 +319,6 @@ func (p *OAuthProxy) redeemCode(host, code string) (s *providers.SessionState, e
 		}
 	}
 	return
-}
-
-// MakeSessionCookie creates an http.Cookie containing the authenticated user's
-// authentication details
-func (p *OAuthProxy) MakeSessionCookie(req *http.Request, value string, expiration time.Duration, now time.Time) []*http.Cookie {
-	if value != "" {
-		value = cookie.SignedValue(p.CookieSeed, p.CookieName, value, now)
-	}
-	c := p.makeCookie(req, p.CookieName, value, expiration, now)
-	if p.CookiesStore != nil {
-		// Proactively cleanup old cookies that might be hanging around
-		for _, requestCookie := range req.Cookies() {
-			if requestCookie.Name == p.CookieName {
-				_, err := p.CookiesStore.Clear(requestCookie)
-				if err != nil {
-					logger.Printf("Unable to clear cookies: %s", err)
-				}
-			}
-		}
-
-		// Store new cookie. Pass the old cookie along just in case
-		requestCookie, _ := req.Cookie(p.CookieName)
-		newCookieValue, err := p.CookiesStore.Store(c, requestCookie)
-		if err != nil {
-			logger.Printf("Unable to load cookie: %s", err)
-		}
-		responseCookie := p.makeCookie(req, p.CookieName, newCookieValue, p.CookieExpire, now)
-		return []*http.Cookie{responseCookie}
-	}
-	if len(c.Value) > 4096-len(p.CookieName) {
-		return splitCookie(c)
-	}
-	return []*http.Cookie{c}
-}
-
-func copyCookie(c *http.Cookie) *http.Cookie {
-	return &http.Cookie{
-		Name:       c.Name,
-		Value:      c.Value,
-		Path:       c.Path,
-		Domain:     c.Domain,
-		Expires:    c.Expires,
-		RawExpires: c.RawExpires,
-		MaxAge:     c.MaxAge,
-		Secure:     c.Secure,
-		HttpOnly:   c.HttpOnly,
-		Raw:        c.Raw,
-		Unparsed:   c.Unparsed,
-	}
-}
-
-// splitCookie reads the full cookie generated to store the session and splits
-// it into a slice of cookies which fit within the 4kb cookie limit indexing
-// the cookies from 0
-func splitCookie(c *http.Cookie) []*http.Cookie {
-	if len(c.Value) < maxCookieLength {
-		return []*http.Cookie{c}
-	}
-	cookies := []*http.Cookie{}
-	valueBytes := []byte(c.Value)
-	count := 0
-	for len(valueBytes) > 0 {
-		new := copyCookie(c)
-		new.Name = fmt.Sprintf("%s_%d", c.Name, count)
-		count++
-		if len(valueBytes) < maxCookieLength {
-			new.Value = string(valueBytes)
-			valueBytes = []byte{}
-		} else {
-			newValue := valueBytes[:maxCookieLength]
-			valueBytes = valueBytes[maxCookieLength:]
-			new.Value = string(newValue)
-		}
-		cookies = append(cookies, new)
-	}
-	return cookies
-}
-
-// joinCookies takes a slice of cookies from the request and reconstructs the
-// full session cookie
-func joinCookies(cookies []*http.Cookie) (*http.Cookie, error) {
-	if len(cookies) == 0 {
-		return nil, fmt.Errorf("list of cookies must be > 0")
-	}
-	if len(cookies) == 1 {
-		return cookies[0], nil
-	}
-	c := copyCookie(cookies[0])
-	for i := 1; i < len(cookies); i++ {
-		c.Value += cookies[i].Value
-	}
-	c.Name = strings.TrimRight(c.Name, "_0")
-	return c, nil
-}
-
-// loadCookie retreieves the sessions state cookie from the http request.
-// If a single cookie is present this will be returned, otherwise it attempts
-// to reconstruct a cookie split up by splitCookie
-func loadCookie(req *http.Request, cookieName string) (*http.Cookie, error) {
-	c, err := req.Cookie(cookieName)
-	if err == nil {
-		return c, nil
-	}
-	cookies := []*http.Cookie{}
-	err = nil
-	count := 0
-	for err == nil {
-		var c *http.Cookie
-		c, err = req.Cookie(fmt.Sprintf("%s_%d", cookieName, count))
-		if err == nil {
-			cookies = append(cookies, c)
-			count++
-		}
-	}
-	if len(cookies) == 0 {
-		return nil, fmt.Errorf("Could not find cookie %s", cookieName)
-	}
-	return joinCookies(cookies)
 }
 
 // MakeCSRFCookie creates a cookie for CSRF
@@ -499,81 +361,18 @@ func (p *OAuthProxy) SetCSRFCookie(rw http.ResponseWriter, req *http.Request, va
 
 // ClearSessionCookie creates a cookie to unset the user's authentication cookie
 // stored in the user's session
-func (p *OAuthProxy) ClearSessionCookie(rw http.ResponseWriter, req *http.Request) {
-	var cookies []*http.Cookie
-
-	// matches CookieName, CookieName_<number>
-	var cookieNameRegex = regexp.MustCompile(fmt.Sprintf("^%s(_\\d+)?$", p.CookieName))
-
-	for _, c := range req.Cookies() {
-		if p.CookiesStore != nil && c.Name == p.CookieName {
-			_, err := p.CookiesStore.Clear(c)
-			if err != nil {
-				logger.Printf("Unable to clear cookie: %s", err)
-			}
-		}
-		if cookieNameRegex.MatchString(c.Name) {
-			clearCookie := p.makeCookie(req, c.Name, "", time.Hour*-1, time.Now())
-
-			http.SetCookie(rw, clearCookie)
-			cookies = append(cookies, clearCookie)
-		}
-	}
-
-	// ugly hack because default domain changed
-	if p.CookieDomain == "" && len(cookies) > 0 {
-		clr2 := *cookies[0]
-		clr2.Domain = req.Host
-		http.SetCookie(rw, &clr2)
-	}
-}
-
-// SetSessionCookie adds the user's session cookie to the response
-func (p *OAuthProxy) SetSessionCookie(rw http.ResponseWriter, req *http.Request, val string) {
-	for _, c := range p.MakeSessionCookie(req, val, p.CookieExpire, time.Now()) {
-		http.SetCookie(rw, c)
-	}
+func (p *OAuthProxy) ClearSessionCookie(rw http.ResponseWriter, req *http.Request) error {
+	return p.sessionStore.Clear(rw, req)
 }
 
 // LoadCookiedSession reads the user's authentication details from the request
-func (p *OAuthProxy) LoadCookiedSession(req *http.Request) (*providers.SessionState, time.Duration, error) {
-	var age time.Duration
-	c, err := loadCookie(req, p.CookieName)
-	if err != nil {
-		// always http.ErrNoCookie
-		return nil, age, fmt.Errorf("Cookie %q not present", p.CookieName)
-	}
-
-	if p.CookiesStore != nil {
-		// If using a cookie store, load the actual value
-		c.Value, err = p.CookiesStore.Load(c)
-		if err != nil {
-			return nil, age, fmt.Errorf("Unable to load cookie: %s", err)
-		}
-	}
-
-	val, timestamp, err := cookie.Validate(c, p.CookieSeed, p.CookieExpire)
-	if err != nil {
-		return nil, age, errors.New("Cookie Signature not valid")
-	}
-
-	session, err := p.provider.SessionFromCookie(val, p.CookieCipher)
-	if err != nil {
-		return nil, age, err
-	}
-
-	age = time.Now().Truncate(time.Second).Sub(timestamp)
-	return session, age, nil
+func (p *OAuthProxy) LoadCookiedSession(req *http.Request) (*sessionsapi.SessionState, error) {
+	return p.sessionStore.Load(req)
 }
 
 // SaveSession creates a new session cookie value and sets this on the response
-func (p *OAuthProxy) SaveSession(rw http.ResponseWriter, req *http.Request, s *providers.SessionState) error {
-	value, err := p.provider.CookieForSession(s, p.CookieCipher)
-	if err != nil {
-		return err
-	}
-	p.SetSessionCookie(rw, req, value)
-	return nil
+func (p *OAuthProxy) SaveSession(rw http.ResponseWriter, req *http.Request, s *sessionsapi.SessionState) error {
+	return p.sessionStore.Save(rw, req, s)
 }
 
 // RobotsTxt disallows scraping pages from the OAuthProxy
@@ -696,20 +495,19 @@ func (p *OAuthProxy) IsValidRedirect(redirect string) bool {
 }
 
 // IsWhitelistedRequest is used to check if auth should be skipped for this request
-func (p *OAuthProxy) IsWhitelistedRequest(req *http.Request) (ok bool) {
+func (p *OAuthProxy) IsWhitelistedRequest(req *http.Request) bool {
 	isPreflightRequestAllowed := p.skipAuthPreflight && req.Method == "OPTIONS"
 	return isPreflightRequestAllowed || p.IsWhitelistedPath(req.URL.Path)
 }
 
 // IsWhitelistedPath is used to check if the request path is allowed without auth
-func (p *OAuthProxy) IsWhitelistedPath(path string) (ok bool) {
+func (p *OAuthProxy) IsWhitelistedPath(path string) bool {
 	for _, u := range p.compiledRegex {
-		ok = u.MatchString(path)
-		if ok {
-			return
+		if u.MatchString(path) {
+			return true
 		}
 	}
-	return
+	return false
 }
 
 func getRemoteAddr(req *http.Request) (s string) {
@@ -754,7 +552,7 @@ func (p *OAuthProxy) SignIn(rw http.ResponseWriter, req *http.Request) {
 
 	user, ok := p.ManualSignIn(rw, req)
 	if ok {
-		session := &providers.SessionState{User: user}
+		session := &sessionsapi.SessionState{User: user}
 		p.SaveSession(rw, req, session)
 		http.Redirect(rw, req, redirect, 302)
 	} else {
@@ -812,7 +610,7 @@ func (p *OAuthProxy) OAuthCallback(rw http.ResponseWriter, req *http.Request) {
 
 	session, err := p.redeemCode(req.Host, req.Form.Get("code"))
 	if err != nil {
-		logger.Printf("Error redeeming code during OAuth2 callback: %s ", errorString)
+		logger.Printf("Error redeeming code during OAuth2 callback: %s ", err.Error())
 		p.ErrorPage(rw, 500, "Internal Error", "Internal Error")
 		return
 	}
@@ -853,44 +651,62 @@ func (p *OAuthProxy) OAuthCallback(rw http.ResponseWriter, req *http.Request) {
 		}
 		http.Redirect(rw, req, redirect, 302)
 	} else {
-		logger.PrintAuthf(session.Email, req, logger.AuthSuccess, "Invalid authentication via OAuth2: unauthorized")
+		logger.PrintAuthf(session.Email, req, logger.AuthFailure, "Invalid authentication via OAuth2: unauthorized")
 		p.ErrorPage(rw, 403, "Permission Denied", "Invalid Account")
 	}
 }
 
 // AuthenticateOnly checks whether the user is currently logged in
 func (p *OAuthProxy) AuthenticateOnly(rw http.ResponseWriter, req *http.Request) {
-	status := p.Authenticate(rw, req)
-	if status == http.StatusAccepted {
-		rw.WriteHeader(http.StatusAccepted)
-	} else {
+	session, err := p.getAuthenticatedSession(rw, req)
+	if err != nil {
 		http.Error(rw, "unauthorized request", http.StatusUnauthorized)
+		return
 	}
+
+	// we are authenticated
+	p.addHeadersForProxying(rw, req, session)
+	rw.WriteHeader(http.StatusAccepted)
 }
 
 // Proxy proxies the user request if the user is authenticated else it prompts
 // them to authenticate
 func (p *OAuthProxy) Proxy(rw http.ResponseWriter, req *http.Request) {
-	status := p.Authenticate(rw, req)
-	if status == http.StatusInternalServerError {
-		p.ErrorPage(rw, http.StatusInternalServerError,
-			"Internal Error", "Internal Error")
-	} else if status == http.StatusForbidden {
+	session, err := p.getAuthenticatedSession(rw, req)
+	switch err {
+	case nil:
+		// we are authenticated
+		p.addHeadersForProxying(rw, req, session)
+		p.serveMux.ServeHTTP(rw, req)
+
+	case ErrNeedsLogin:
+		// we need to send the user to a login screen
+		if isAjax(req) {
+			// no point redirecting an AJAX request
+			p.ErrorJSON(rw, http.StatusUnauthorized)
+			return
+		}
+
 		if p.SkipProviderButton {
 			p.OAuthStart(rw, req)
 		} else {
 			p.SignInPage(rw, req, http.StatusForbidden)
 		}
-	} else if status == http.StatusUnauthorized {
-		p.ErrorJSON(rw, status)
-	} else {
-		p.serveMux.ServeHTTP(rw, req)
+
+	default:
+		// unknown error
+		logger.Printf("Unexpected internal error: %s", err)
+		p.ErrorPage(rw, http.StatusInternalServerError,
+			"Internal Error", "Internal Error")
 	}
+
 }
 
-// Authenticate checks whether a user is authenticated
-func (p *OAuthProxy) Authenticate(rw http.ResponseWriter, req *http.Request) int {
-	var session *providers.SessionState
+// getAuthenticatedSession checks whether a user is authenticated and returns a session object and nil error if so
+// Returns nil, ErrNeedsLogin if user needs to login.
+// Set-Cookie headers may be set on the response as a side-effect of calling this method.
+func (p *OAuthProxy) getAuthenticatedSession(rw http.ResponseWriter, req *http.Request) (*sessionsapi.SessionState, error) {
+	var session *sessionsapi.SessionState
 	var err error
 	var saveSession, clearSession, revalidated bool
 
@@ -906,26 +722,25 @@ func (p *OAuthProxy) Authenticate(rw http.ResponseWriter, req *http.Request) int
 
 	remoteAddr := getRemoteAddr(req)
 	if session == nil {
-		var sessionAge time.Duration
-		session, sessionAge, err = p.LoadCookiedSession(req)
+		session, err = p.LoadCookiedSession(req)
 		if err != nil {
 			logger.Printf("Error loading cookied session: %s", err)
 		}
-		if session != nil && sessionAge > p.CookieRefresh && p.CookieRefresh != time.Duration(0) {
-			logger.Printf("Refreshing %s old session cookie for %s (refresh after %s)", sessionAge, session, p.CookieRefresh)
-			saveSession = true
-		}
-	}
 
-	if session != nil {
-		var ok bool
-		if ok, err = p.provider.RefreshSessionIfNeeded(session); err != nil {
-			logger.Printf("%s removing session. error refreshing access token %s %s", remoteAddr, err, session)
-			clearSession = true
-			session = nil
-		} else if ok {
-			saveSession = true
-			revalidated = true
+		if session != nil {
+			if session.Age() > p.CookieRefresh && p.CookieRefresh != time.Duration(0) {
+				logger.Printf("Refreshing %s old session cookie for %s (refresh after %s)", session.Age(), session, p.CookieRefresh)
+				saveSession = true
+			}
+
+			if ok, err := p.provider.RefreshSessionIfNeeded(session); err != nil {
+				logger.Printf("%s removing session. error refreshing access token %s %s", remoteAddr, err, session)
+				clearSession = true
+				session = nil
+			} else if ok {
+				saveSession = true
+				revalidated = true
+			}
 		}
 	}
 
@@ -945,18 +760,20 @@ func (p *OAuthProxy) Authenticate(rw http.ResponseWriter, req *http.Request) int
 		}
 	}
 
-	if session != nil && session.Email != "" && !p.Validator(session.Email) {
-		logger.Printf(session.Email, req, logger.AuthFailure, "Invalid authentication via session: removing session %s", session)
-		session = nil
-		saveSession = false
-		clearSession = true
+	if session != nil && session.Email != "" {
+		if !p.Validator(session.Email) || !p.provider.ValidateGroup(session.Email) {
+			logger.Printf(session.Email, req, logger.AuthFailure, "Invalid authentication via session: removing session %s", session)
+			session = nil
+			saveSession = false
+			clearSession = true
+		}
 	}
 
 	if saveSession && session != nil {
 		err = p.SaveSession(rw, req, session)
 		if err != nil {
 			logger.PrintAuthf(session.Email, req, logger.AuthError, "Save session error %s", err)
-			return http.StatusInternalServerError
+			return nil, err
 		}
 	}
 
@@ -972,15 +789,14 @@ func (p *OAuthProxy) Authenticate(rw http.ResponseWriter, req *http.Request) int
 	}
 
 	if session == nil {
-		// Check if is an ajax request and return unauthorized to avoid a redirect
-		// to the login page
-		if p.isAjax(req) {
-			return http.StatusUnauthorized
-		}
-		return http.StatusForbidden
+		return nil, ErrNeedsLogin
 	}
 
-	// At this point, the user is authenticated. proxy normally
+	return session, nil
+}
+
+// addHeadersForProxying adds the appropriate headers the request / response for proxying
+func (p *OAuthProxy) addHeadersForProxying(rw http.ResponseWriter, req *http.Request, session *sessionsapi.SessionState) {
 	if p.PassBasicAuth {
 		req.SetBasicAuth(session.User, p.BasicAuthPassword)
 		req.Header["X-Forwarded-User"] = []string{session.User}
@@ -1017,12 +833,11 @@ func (p *OAuthProxy) Authenticate(rw http.ResponseWriter, req *http.Request) int
 	} else {
 		rw.Header().Set("GAP-Auth", session.Email)
 	}
-	return http.StatusAccepted
 }
 
 // CheckBasicAuth checks the requests Authorization header for basic auth
 // credentials and authenticates these against the proxies HtpasswdFile
-func (p *OAuthProxy) CheckBasicAuth(req *http.Request) (*providers.SessionState, error) {
+func (p *OAuthProxy) CheckBasicAuth(req *http.Request) (*sessionsapi.SessionState, error) {
 	if p.HtpasswdFile == nil {
 		return nil, nil
 	}
@@ -1044,14 +859,14 @@ func (p *OAuthProxy) CheckBasicAuth(req *http.Request) (*providers.SessionState,
 	}
 	if p.HtpasswdFile.Validate(pair[0], pair[1]) {
 		logger.PrintAuthf(pair[0], req, logger.AuthSuccess, "Authenticated via basic auth and HTpasswd File")
-		return &providers.SessionState{User: pair[0]}, nil
+		return &sessionsapi.SessionState{User: pair[0]}, nil
 	}
 	logger.PrintAuthf(pair[0], req, logger.AuthFailure, "Invalid authentication via basic auth: not in Htpasswd File")
 	return nil, nil
 }
 
 // isAjax checks if a request is an ajax request
-func (p *OAuthProxy) isAjax(req *http.Request) bool {
+func isAjax(req *http.Request) bool {
 	acceptValues, ok := req.Header["accept"]
 	if !ok {
 		acceptValues = req.Header["Accept"]
@@ -1072,14 +887,14 @@ func (p *OAuthProxy) ErrorJSON(rw http.ResponseWriter, code int) {
 }
 
 // GetJwtSession loads a session based on a JWT token in the authorization header.
-func (p *OAuthProxy) GetJwtSession(req *http.Request) (*providers.SessionState, error) {
+func (p *OAuthProxy) GetJwtSession(req *http.Request) (*sessionsapi.SessionState, error) {
 	rawBearerToken, err := p.findBearerToken(req)
 	if err != nil {
 		return nil, err
 	}
 
 	ctx := context.Background()
-	var session *providers.SessionState
+	var session *sessionsapi.SessionState
 	for _, verifier := range p.jwtBearerVerifiers {
 		bearerToken, err := verifier.Verify(ctx, rawBearerToken)
 
@@ -1105,15 +920,14 @@ func (p *OAuthProxy) GetJwtSession(req *http.Request) (*providers.SessionState, 
 		if claims.Verified != nil && !*claims.Verified {
 			return nil, fmt.Errorf("email in id_token (%s) isn't verified", claims.Email)
 		}
-		user := strings.Split(claims.Email, "@")[0]
 
-		session = &providers.SessionState{
+		session = &sessionsapi.SessionState{
 			AccessToken:  rawBearerToken,
 			IDToken:      rawBearerToken,
 			RefreshToken: "",
 			ExpiresOn:    bearerToken.Expiry,
 			Email:        claims.Email,
-			User:         user,
+			User:         claims.Email,
 		}
 		return session, nil
 	}
@@ -1155,33 +969,21 @@ func (p *OAuthProxy) findBearerToken(req *http.Request) (string, error) {
 			rawBearerToken = password
 		}
 	}
-	if rawBearerToken == "" {
-		return "", fmt.Errorf("no valid bearer token found in authorization header")
-	}
 
+	redisStore, ok := p.sessionStore.(*redis.SessionStore)
 	// Check if this is actually a session identifier
-	if p.CookiesStore != nil && strings.HasPrefix(rawBearerToken, p.CookieName) {
-		// Mock the header as a request cookie
-		c := &http.Cookie{Name: p.CookieName, Value: rawBearerToken}
-		signedSession, err := p.CookiesStore.Load(c)
+	if ok && strings.HasPrefix(rawBearerToken, p.CookieName){
+		session, err := redisStore.LoadSessionFromString(rawBearerToken)
 		if err != nil {
-			logger.Printf("error loading ticket from store: %v", err)
-		}
-		// Only proceed if we found a cookie in the cookie store
-		if err == nil {
-			c.Value = signedSession
-			serverSession, _, err := cookie.Validate(c, p.CookieSeed, p.CookieExpire)
-			if err != nil {
-				return "", fmt.Errorf("unable to validate cookie loaded from cookie store: %v", err)
-			}
-			session, err := providers.DecodeSessionState(serverSession, p.CookieCipher)
-			if err != nil {
-				return "", fmt.Errorf("unable to decode session from cookie store: %v", err)
-			}
+			logger.PrintAuthf("", req, logger.AuthFailure, "error loading ticket from store: %v", err)
+		} else {
+			// Only proceed if we found a cookie in the cookie store
 			rawBearerToken = session.IDToken
 		}
-	} else {
-		logger.Printf("not checking ticket: %s, prefix: %s", rawBearerToken, p.CookieName)
+	}
+
+	if rawBearerToken == "" {
+		return "", fmt.Errorf("no valid bearer token found in authorization header")
 	}
 
 	return rawBearerToken, nil

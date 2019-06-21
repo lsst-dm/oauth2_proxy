@@ -19,6 +19,8 @@ import (
 	"github.com/coreos/go-oidc"
 	"github.com/mbland/hmacauth"
 	"github.com/pusher/oauth2_proxy/logger"
+	"github.com/pusher/oauth2_proxy/pkg/apis/sessions"
+	"github.com/pusher/oauth2_proxy/pkg/sessions/cookie"
 	"github.com/pusher/oauth2_proxy/providers"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -227,8 +229,9 @@ func TestIsValidRedirect(t *testing.T) {
 
 type TestProvider struct {
 	*providers.ProviderData
-	EmailAddress string
-	ValidToken   bool
+	EmailAddress   string
+	ValidToken     bool
+	GroupValidator func(string) bool
 }
 
 func NewTestProvider(providerURL *url.URL, emailAddress string) *TestProvider {
@@ -253,15 +256,25 @@ func NewTestProvider(providerURL *url.URL, emailAddress string) *TestProvider {
 			Scope: "profile.email",
 		},
 		EmailAddress: emailAddress,
+		GroupValidator: func(s string) bool {
+			return true
+		},
 	}
 }
 
-func (tp *TestProvider) GetEmailAddress(session *providers.SessionState) (string, error) {
+func (tp *TestProvider) GetEmailAddress(session *sessions.SessionState) (string, error) {
 	return tp.EmailAddress, nil
 }
 
-func (tp *TestProvider) ValidateSessionState(session *providers.SessionState) bool {
+func (tp *TestProvider) ValidateSessionState(session *sessions.SessionState) bool {
 	return tp.ValidToken
+}
+
+func (tp *TestProvider) ValidateGroup(email string) bool {
+	if tp.GroupValidator != nil {
+		return tp.GroupValidator(email)
+	}
+	return true
 }
 
 func TestBasicAuthPassword(t *testing.T) {
@@ -294,8 +307,7 @@ func TestBasicAuthPassword(t *testing.T) {
 	opts.Validate()
 
 	providerURL, _ := url.Parse(providerServer.URL)
-	const emailAddress = "michael.bland@gsa.gov"
-	const username = "michael.bland"
+	const emailAddress = "john.doe@example.com"
 
 	opts.provider = NewTestProvider(providerURL, emailAddress)
 	proxy := NewOAuthProxy(opts, func(email string) bool {
@@ -338,7 +350,9 @@ func TestBasicAuthPassword(t *testing.T) {
 	rw = httptest.NewRecorder()
 	proxy.ServeHTTP(rw, req)
 
-	expectedHeader := "Basic " + base64.StdEncoding.EncodeToString([]byte(username+":"+opts.BasicAuthPassword))
+	// The username in the basic auth credentials is expected to be equal to the email address from the
+	// auth response, so we use the same variable here.
+	expectedHeader := "Basic " + base64.StdEncoding.EncodeToString([]byte(emailAddress+":"+opts.BasicAuthPassword))
 	assert.Equal(t, expectedHeader, rw.Body.String())
 	providerServer.Close()
 }
@@ -601,10 +615,15 @@ type ProcessCookieTestOpts struct {
 	providerValidateCookieResponse bool
 }
 
-func NewProcessCookieTest(opts ProcessCookieTestOpts) *ProcessCookieTest {
+type OptionsModifier func(*Options)
+
+func NewProcessCookieTest(opts ProcessCookieTestOpts, modifiers ...OptionsModifier) *ProcessCookieTest {
 	var pcTest ProcessCookieTest
 
 	pcTest.opts = NewOptions()
+	for _, modifier := range modifiers {
+		modifier(pcTest.opts)
+	}
 	pcTest.opts.ClientID = "bazquux"
 	pcTest.opts.ClientSecret = "xyzzyplugh"
 	pcTest.opts.CookieSecret = "0123456789abcdefabcd"
@@ -635,42 +654,44 @@ func NewProcessCookieTestWithDefaults() *ProcessCookieTest {
 	})
 }
 
-func (p *ProcessCookieTest) MakeCookie(value string, ref time.Time) []*http.Cookie {
-	return p.proxy.MakeSessionCookie(p.req, value, p.opts.CookieExpire, ref)
+func NewProcessCookieTestWithOptionsModifiers(modifiers ...OptionsModifier) *ProcessCookieTest {
+	return NewProcessCookieTest(ProcessCookieTestOpts{
+		providerValidateCookieResponse: true,
+	}, modifiers...)
 }
 
-func (p *ProcessCookieTest) SaveSession(s *providers.SessionState, ref time.Time) error {
-	value, err := p.proxy.provider.CookieForSession(s, p.proxy.CookieCipher)
+func (p *ProcessCookieTest) SaveSession(s *sessions.SessionState) error {
+	err := p.proxy.SaveSession(p.rw, p.req, s)
 	if err != nil {
 		return err
 	}
-	for _, c := range p.proxy.MakeSessionCookie(p.req, value, p.proxy.CookieExpire, ref) {
-		p.req.AddCookie(c)
+	for _, cookie := range p.rw.Result().Cookies() {
+		p.req.AddCookie(cookie)
 	}
 	return nil
 }
 
-func (p *ProcessCookieTest) LoadCookiedSession() (*providers.SessionState, time.Duration, error) {
+func (p *ProcessCookieTest) LoadCookiedSession() (*sessions.SessionState, error) {
 	return p.proxy.LoadCookiedSession(p.req)
 }
 
 func TestLoadCookiedSession(t *testing.T) {
 	pcTest := NewProcessCookieTestWithDefaults()
 
-	startSession := &providers.SessionState{Email: "michael.bland@gsa.gov", AccessToken: "my_access_token"}
-	pcTest.SaveSession(startSession, time.Now())
+	startSession := &sessions.SessionState{Email: "john.doe@example.com", AccessToken: "my_access_token", CreatedAt: time.Now()}
+	pcTest.SaveSession(startSession)
 
-	session, _, err := pcTest.LoadCookiedSession()
+	session, err := pcTest.LoadCookiedSession()
 	assert.Equal(t, nil, err)
 	assert.Equal(t, startSession.Email, session.Email)
-	assert.Equal(t, "michael.bland", session.User)
+	assert.Equal(t, "john.doe@example.com", session.User)
 	assert.Equal(t, startSession.AccessToken, session.AccessToken)
 }
 
 func TestProcessCookieNoCookieError(t *testing.T) {
 	pcTest := NewProcessCookieTestWithDefaults()
 
-	session, _, err := pcTest.LoadCookiedSession()
+	session, err := pcTest.LoadCookiedSession()
 	assert.Equal(t, "Cookie \"_oauth2_proxy\" not present", err.Error())
 	if session != nil {
 		t.Errorf("expected nil session. got %#v", session)
@@ -678,29 +699,31 @@ func TestProcessCookieNoCookieError(t *testing.T) {
 }
 
 func TestProcessCookieRefreshNotSet(t *testing.T) {
-	pcTest := NewProcessCookieTestWithDefaults()
-	pcTest.proxy.CookieExpire = time.Duration(23) * time.Hour
+	pcTest := NewProcessCookieTestWithOptionsModifiers(func(opts *Options) {
+		opts.CookieExpire = time.Duration(23) * time.Hour
+	})
 	reference := time.Now().Add(time.Duration(-2) * time.Hour)
 
-	startSession := &providers.SessionState{Email: "michael.bland@gsa.gov", AccessToken: "my_access_token"}
-	pcTest.SaveSession(startSession, reference)
+	startSession := &sessions.SessionState{Email: "michael.bland@gsa.gov", AccessToken: "my_access_token", CreatedAt: reference}
+	pcTest.SaveSession(startSession)
 
-	session, age, err := pcTest.LoadCookiedSession()
+	session, err := pcTest.LoadCookiedSession()
 	assert.Equal(t, nil, err)
-	if age < time.Duration(-2)*time.Hour {
-		t.Errorf("cookie too young %v", age)
+	if session.Age() < time.Duration(-2)*time.Hour {
+		t.Errorf("cookie too young %v", session.Age())
 	}
 	assert.Equal(t, startSession.Email, session.Email)
 }
 
 func TestProcessCookieFailIfCookieExpired(t *testing.T) {
-	pcTest := NewProcessCookieTestWithDefaults()
-	pcTest.proxy.CookieExpire = time.Duration(24) * time.Hour
+	pcTest := NewProcessCookieTestWithOptionsModifiers(func(opts *Options) {
+		opts.CookieExpire = time.Duration(24) * time.Hour
+	})
 	reference := time.Now().Add(time.Duration(25) * time.Hour * -1)
-	startSession := &providers.SessionState{Email: "michael.bland@gsa.gov", AccessToken: "my_access_token"}
-	pcTest.SaveSession(startSession, reference)
+	startSession := &sessions.SessionState{Email: "michael.bland@gsa.gov", AccessToken: "my_access_token", CreatedAt: reference}
+	pcTest.SaveSession(startSession)
 
-	session, _, err := pcTest.LoadCookiedSession()
+	session, err := pcTest.LoadCookiedSession()
 	assert.NotEqual(t, nil, err)
 	if session != nil {
 		t.Errorf("expected nil session %#v", session)
@@ -708,22 +731,23 @@ func TestProcessCookieFailIfCookieExpired(t *testing.T) {
 }
 
 func TestProcessCookieFailIfRefreshSetAndCookieExpired(t *testing.T) {
-	pcTest := NewProcessCookieTestWithDefaults()
-	pcTest.proxy.CookieExpire = time.Duration(24) * time.Hour
+	pcTest := NewProcessCookieTestWithOptionsModifiers(func(opts *Options) {
+		opts.CookieExpire = time.Duration(24) * time.Hour
+	})
 	reference := time.Now().Add(time.Duration(25) * time.Hour * -1)
-	startSession := &providers.SessionState{Email: "michael.bland@gsa.gov", AccessToken: "my_access_token"}
-	pcTest.SaveSession(startSession, reference)
+	startSession := &sessions.SessionState{Email: "michael.bland@gsa.gov", AccessToken: "my_access_token", CreatedAt: reference}
+	pcTest.SaveSession(startSession)
 
 	pcTest.proxy.CookieRefresh = time.Hour
-	session, _, err := pcTest.LoadCookiedSession()
+	session, err := pcTest.LoadCookiedSession()
 	assert.NotEqual(t, nil, err)
 	if session != nil {
 		t.Errorf("expected nil session %#v", session)
 	}
 }
 
-func NewAuthOnlyEndpointTest() *ProcessCookieTest {
-	pcTest := NewProcessCookieTestWithDefaults()
+func NewAuthOnlyEndpointTest(modifiers ...OptionsModifier) *ProcessCookieTest {
+	pcTest := NewProcessCookieTestWithOptionsModifiers(modifiers...)
 	pcTest.req, _ = http.NewRequest("GET",
 		pcTest.opts.ProxyPrefix+"/auth", nil)
 	return pcTest
@@ -731,9 +755,9 @@ func NewAuthOnlyEndpointTest() *ProcessCookieTest {
 
 func TestAuthOnlyEndpointAccepted(t *testing.T) {
 	test := NewAuthOnlyEndpointTest()
-	startSession := &providers.SessionState{
-		Email: "michael.bland@gsa.gov", AccessToken: "my_access_token"}
-	test.SaveSession(startSession, time.Now())
+	startSession := &sessions.SessionState{
+		Email: "michael.bland@gsa.gov", AccessToken: "my_access_token", CreatedAt: time.Now()}
+	test.SaveSession(startSession)
 
 	test.proxy.ServeHTTP(test.rw, test.req)
 	assert.Equal(t, http.StatusAccepted, test.rw.Code)
@@ -751,12 +775,13 @@ func TestAuthOnlyEndpointUnauthorizedOnNoCookieSetError(t *testing.T) {
 }
 
 func TestAuthOnlyEndpointUnauthorizedOnExpiration(t *testing.T) {
-	test := NewAuthOnlyEndpointTest()
-	test.proxy.CookieExpire = time.Duration(24) * time.Hour
+	test := NewAuthOnlyEndpointTest(func(opts *Options) {
+		opts.CookieExpire = time.Duration(24) * time.Hour
+	})
 	reference := time.Now().Add(time.Duration(25) * time.Hour * -1)
-	startSession := &providers.SessionState{
-		Email: "michael.bland@gsa.gov", AccessToken: "my_access_token"}
-	test.SaveSession(startSession, reference)
+	startSession := &sessions.SessionState{
+		Email: "michael.bland@gsa.gov", AccessToken: "my_access_token", CreatedAt: reference}
+	test.SaveSession(startSession)
 
 	test.proxy.ServeHTTP(test.rw, test.req)
 	assert.Equal(t, http.StatusUnauthorized, test.rw.Code)
@@ -766,11 +791,30 @@ func TestAuthOnlyEndpointUnauthorizedOnExpiration(t *testing.T) {
 
 func TestAuthOnlyEndpointUnauthorizedOnEmailValidationFailure(t *testing.T) {
 	test := NewAuthOnlyEndpointTest()
-	startSession := &providers.SessionState{
-		Email: "michael.bland@gsa.gov", AccessToken: "my_access_token"}
-	test.SaveSession(startSession, time.Now())
+	startSession := &sessions.SessionState{
+		Email: "michael.bland@gsa.gov", AccessToken: "my_access_token", CreatedAt: time.Now()}
+	test.SaveSession(startSession)
 	test.validateUser = false
 
+	test.proxy.ServeHTTP(test.rw, test.req)
+	assert.Equal(t, http.StatusUnauthorized, test.rw.Code)
+	bodyBytes, _ := ioutil.ReadAll(test.rw.Body)
+	assert.Equal(t, "unauthorized request\n", string(bodyBytes))
+}
+
+func TestAuthOnlyEndpointUnauthorizedOnProviderGroupValidationFailure(t *testing.T) {
+	test := NewAuthOnlyEndpointTest()
+	startSession := &sessions.SessionState{
+		Email: "michael.bland@gsa.gov", AccessToken: "my_access_token", CreatedAt: time.Now()}
+	test.SaveSession(startSession)
+	provider := &TestProvider{
+		ValidToken: true,
+		GroupValidator: func(s string) bool {
+			return false
+		},
+	}
+
+	test.proxy.provider = provider
 	test.proxy.ServeHTTP(test.rw, test.req)
 	assert.Equal(t, http.StatusUnauthorized, test.rw.Code)
 	bodyBytes, _ := ioutil.ReadAll(test.rw.Body)
@@ -797,9 +841,9 @@ func TestAuthOnlyEndpointSetXAuthRequestHeaders(t *testing.T) {
 	pcTest.req, _ = http.NewRequest("GET",
 		pcTest.opts.ProxyPrefix+"/auth", nil)
 
-	startSession := &providers.SessionState{
-		User: "oauth_user", Email: "oauth_user@example.com", AccessToken: "oauth_token"}
-	pcTest.SaveSession(startSession, time.Now())
+	startSession := &sessions.SessionState{
+		User: "oauth_user", Email: "oauth_user@example.com", AccessToken: "oauth_token", CreatedAt: time.Now()}
+	pcTest.SaveSession(startSession)
 
 	pcTest.proxy.ServeHTTP(pcTest.rw, pcTest.req)
 	assert.Equal(t, http.StatusAccepted, pcTest.rw.Code)
@@ -929,13 +973,13 @@ func (st *SignatureTest) MakeRequestWithExpectedKey(method, body, key string) {
 	req := httptest.NewRequest(method, "/foo/bar", bodyBuf)
 	req.Header = st.header
 
-	state := &providers.SessionState{
+	state := &sessions.SessionState{
 		Email: "mbland@acm.org", AccessToken: "my_access_token"}
-	value, err := proxy.provider.CookieForSession(state, proxy.CookieCipher)
+	err = proxy.SaveSession(st.rw, req, state)
 	if err != nil {
 		panic(err)
 	}
-	for _, c := range proxy.MakeSessionCookie(req, value, proxy.CookieExpire, time.Now()) {
+	for _, c := range st.rw.Result().Cookies() {
 		req.AddCookie(c)
 	}
 	// This is used by the upstream to validate the signature.
@@ -1069,7 +1113,12 @@ func TestAjaxForbiddendRequest(t *testing.T) {
 }
 
 func TestClearSplitCookie(t *testing.T) {
-	p := OAuthProxy{CookieName: "oauth2", CookieDomain: "abc"}
+	opts := NewOptions()
+	opts.CookieName = "oauth2"
+	opts.CookieDomain = "abc"
+	store, err := cookie.NewCookieSessionStore(&opts.SessionOptions, &opts.CookieOptions)
+	assert.Equal(t, err, nil)
+	p := OAuthProxy{CookieName: opts.CookieName, CookieDomain: opts.CookieDomain, sessionStore: store}
 	var rw = httptest.NewRecorder()
 	req := httptest.NewRequest("get", "/", nil)
 
@@ -1093,7 +1142,12 @@ func TestClearSplitCookie(t *testing.T) {
 }
 
 func TestClearSingleCookie(t *testing.T) {
-	p := OAuthProxy{CookieName: "oauth2", CookieDomain: "abc"}
+	opts := NewOptions()
+	opts.CookieName = "oauth2"
+	opts.CookieDomain = "abc"
+	store, err := cookie.NewCookieSessionStore(&opts.SessionOptions, &opts.CookieOptions)
+	assert.Equal(t, err, nil)
+	p := OAuthProxy{CookieName: opts.CookieName, CookieDomain: opts.CookieDomain, sessionStore: store}
 	var rw = httptest.NewRecorder()
 	req := httptest.NewRequest("get", "/", nil)
 
@@ -1144,69 +1198,80 @@ func TestGetJwtSession(t *testing.T) {
 	keyset := NoOpKeySet{}
 	verifier := oidc.NewVerifier("https://issuer.example.com", keyset,
 		&oidc.Config{ClientID: "https://test.myapp.com", SkipExpiryCheck: true})
-	p := OAuthProxy{}
-	p.jwtBearerVerifiers = append(p.jwtBearerVerifiers, verifier)
 
-	req, _ := http.NewRequest("GET", "/", strings.NewReader(""))
+	test := NewAuthOnlyEndpointTest(func(opts *Options) {
+		opts.PassAuthorization = true
+		opts.SetAuthorization = true
+		opts.SetXAuthRequest = true
+		opts.SkipJwtBearerTokens = true
+		opts.jwtBearerVerifiers = append(opts.jwtBearerVerifiers, verifier)
+	})
+	tp, _ := test.proxy.provider.(*TestProvider)
+	tp.GroupValidator = func(s string) bool {
+		return true
+	}
+
 	authHeader := fmt.Sprintf("Bearer %s", goodJwt)
-	req.Header = map[string][]string{
+	test.req.Header = map[string][]string{
 		"Authorization": {authHeader},
 	}
 
 	// Bearer
-	session, _ := p.GetJwtSession(req)
-	assert.Equal(t, session.User, "john")
+	session, _ := test.proxy.GetJwtSession(test.req)
+	assert.Equal(t, session.User, "john@example.com")
 	assert.Equal(t, session.Email, "john@example.com")
 	assert.Equal(t, session.ExpiresOn, time.Unix(1912151821, 0))
 	assert.Equal(t, session.IDToken, goodJwt)
 
-	jwtProviderServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		logger.Printf("%#v", r)
-		var payload string
-		payload = r.Header.Get("Authorization")
-		if payload == "" {
-			payload = "No Authorization header found."
-		}
-		w.WriteHeader(200)
-		w.Write([]byte(payload))
-	}))
-
-	opts := NewOptions()
-	opts.Upstreams = append(opts.Upstreams, jwtProviderServer.URL)
-	opts.PassAuthorization = true
-	opts.SetAuthorization = true
-	opts.SetXAuthRequest = true
-	opts.CookieSecret = "0123456789abcdef0123"
-	opts.SkipJwtBearerTokens = true
-	opts.Validate()
-
-	// We can't actually use opts.Validate() because it will attempt to find a jwks URI
-	opts.jwtBearerVerifiers = append(opts.jwtBearerVerifiers, verifier)
-
-	providerURL, _ := url.Parse(jwtProviderServer.URL)
-	const emailAddress = "john@example.com"
-
-	opts.provider = NewTestProvider(providerURL, emailAddress)
-	jwtTestProxy := NewOAuthProxy(opts, func(email string) bool {
-		return email == emailAddress
-	})
-
-	rw := httptest.NewRecorder()
-	jwtTestProxy.ServeHTTP(rw, req)
-	if rw.Code >= 400 {
-		t.Fatalf("expected 3xx got %d", rw.Code)
+	test.proxy.ServeHTTP(test.rw, test.req)
+	if test.rw.Code >= 400 {
+		t.Fatalf("expected 3xx got %d", test.rw.Code)
 	}
 
 	// Check PassAuthorization, should overwrite Basic header
-	assert.Equal(t, req.Header.Get("Authorization"), authHeader)
-	assert.Equal(t, req.Header.Get("X-Forwarded-User"), "john")
-	assert.Equal(t, req.Header.Get("X-Forwarded-Email"), "john@example.com")
+	assert.Equal(t, test.req.Header.Get("Authorization"), authHeader)
+	assert.Equal(t, test.req.Header.Get("X-Forwarded-User"), "john@example.com")
+	assert.Equal(t, test.req.Header.Get("X-Forwarded-Email"), "john@example.com")
 
 	// SetAuthorization and SetXAuthRequest
-	assert.Equal(t, rw.Header().Get("Authorization"), authHeader)
-	assert.Equal(t, rw.Header().Get("X-Auth-Request-User"), "john")
-	assert.Equal(t, rw.Header().Get("X-Auth-Request-Email"), "john@example.com")
+	assert.Equal(t, test.rw.Header().Get("Authorization"), authHeader)
+	assert.Equal(t, test.rw.Header().Get("X-Auth-Request-User"), "john@example.com")
+	assert.Equal(t, test.rw.Header().Get("X-Auth-Request-Email"), "john@example.com")
+}
 
+func TestJwtUnauthorizedOnGroupValidationFailure(t *testing.T) {
+	goodJwt := "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9." +
+		"eyJzdWIiOiIxMjM0NTY3ODkwIiwiYXVkIjoiaHR0cHM6Ly90ZXN0Lm15YXBwLmNvbSIsIm5hbWUiOiJKb2huIERvZSIsImVtY" +
+		"WlsIjoiam9obkBleGFtcGxlLmNvbSIsImlzcyI6Imh0dHBzOi8vaXNzdWVyLmV4YW1wbGUuY29tIiwiaWF0IjoxNTUzNjkxMj" +
+		"E1LCJleHAiOjE5MTIxNTE4MjF9." +
+		"rLVyzOnEldUq_pNkfa-WiV8TVJYWyZCaM2Am_uo8FGg11zD7l-qmz3x1seTvqpH6Y0Ty00fmv6dJnGnC8WMnPXQiodRTfhBSe" +
+		"OKZMu0HkMD2sg52zlKkbfLTO6ic5VnbVgwjjrB8am_Ta6w7kyFUaB5C1BsIrrLMldkWEhynbb8"
+
+	keyset := NoOpKeySet{}
+	verifier := oidc.NewVerifier("https://issuer.example.com", keyset,
+		&oidc.Config{ClientID: "https://test.myapp.com", SkipExpiryCheck: true})
+
+	test := NewAuthOnlyEndpointTest(func(opts *Options) {
+		opts.PassAuthorization = true
+		opts.SetAuthorization = true
+		opts.SetXAuthRequest = true
+		opts.SkipJwtBearerTokens = true
+		opts.jwtBearerVerifiers = append(opts.jwtBearerVerifiers, verifier)
+	})
+	tp, _ := test.proxy.provider.(*TestProvider)
+	// Verify ValidateGroup fails JWT authorization
+	tp.GroupValidator = func(s string) bool {
+		return false
+	}
+
+	authHeader := fmt.Sprintf("Bearer %s", goodJwt)
+	test.req.Header = map[string][]string{
+		"Authorization": {authHeader},
+	}
+	test.proxy.ServeHTTP(test.rw, test.req)
+	if test.rw.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 got %d", test.rw.Code)
+	}
 }
 
 func TestFindJwtBearerToken(t *testing.T) {

@@ -16,9 +16,12 @@ import (
 
 	oidc "github.com/coreos/go-oidc"
 	"github.com/dgrijalva/jwt-go"
-	"github.com/go-redis/redis"
 	"github.com/mbland/hmacauth"
+	"github.com/pusher/oauth2_proxy/cookie"
 	"github.com/pusher/oauth2_proxy/logger"
+	"github.com/pusher/oauth2_proxy/pkg/apis/options"
+	sessionsapi "github.com/pusher/oauth2_proxy/pkg/apis/sessions"
+	"github.com/pusher/oauth2_proxy/pkg/sessions"
 	"github.com/pusher/oauth2_proxy/providers"
 	"gopkg.in/natefinch/lumberjack.v2"
 )
@@ -45,20 +48,16 @@ type Options struct {
 	GoogleGroups             []string `flag:"google-group" cfg:"google_group" env:"OAUTH2_PROXY_GOOGLE_GROUPS"`
 	GoogleAdminEmail         string   `flag:"google-admin-email" cfg:"google_admin_email" env:"OAUTH2_PROXY_GOOGLE_ADMIN_EMAIL"`
 	GoogleServiceAccountJSON string   `flag:"google-service-account-json" cfg:"google_service_account_json" env:"OAUTH2_PROXY_GOOGLE_SERVICE_ACCOUNT_JSON"`
-	RedisConnectionURL       string   `flag:"redis-connection-url" cfg:"redis_connection_url"`
 	HtpasswdFile             string   `flag:"htpasswd-file" cfg:"htpasswd_file" env:"OAUTH2_PROXY_HTPASSWD_FILE"`
 	DisplayHtpasswdForm      bool     `flag:"display-htpasswd-form" cfg:"display_htpasswd_form" env:"OAUTH2_PROXY_DISPLAY_HTPASSWD_FORM"`
 	CustomTemplatesDir       string   `flag:"custom-templates-dir" cfg:"custom_templates_dir" env:"OAUTH2_PROXY_CUSTOM_TEMPLATES_DIR"`
 	Footer                   string   `flag:"footer" cfg:"footer" env:"OAUTH2_PROXY_FOOTER"`
 
-	CookieName     string        `flag:"cookie-name" cfg:"cookie_name" env:"OAUTH2_PROXY_COOKIE_NAME"`
-	CookieSecret   string        `flag:"cookie-secret" cfg:"cookie_secret" env:"OAUTH2_PROXY_COOKIE_SECRET"`
-	CookieDomain   string        `flag:"cookie-domain" cfg:"cookie_domain" env:"OAUTH2_PROXY_COOKIE_DOMAIN"`
-	CookiePath     string        `flag:"cookie-path" cfg:"cookie_path" env:"OAUTH2_PROXY_COOKIE_PATH"`
-	CookieExpire   time.Duration `flag:"cookie-expire" cfg:"cookie_expire" env:"OAUTH2_PROXY_COOKIE_EXPIRE"`
-	CookieRefresh  time.Duration `flag:"cookie-refresh" cfg:"cookie_refresh" env:"OAUTH2_PROXY_COOKIE_REFRESH"`
-	CookieSecure   bool          `flag:"cookie-secure" cfg:"cookie_secure" env:"OAUTH2_PROXY_COOKIE_SECURE"`
-	CookieHTTPOnly bool          `flag:"cookie-httponly" cfg:"cookie_httponly" env:"OAUTH2_PROXY_COOKIE_HTTPONLY"`
+	// Embed CookieOptions
+	options.CookieOptions
+
+	// Embed SessionOptions
+	options.SessionOptions
 
 	Upstreams             []string      `flag:"upstream" cfg:"upstreams" env:"OAUTH2_PROXY_UPSTREAMS"`
 	SkipAuthRegex         []string      `flag:"skip-auth-regex" cfg:"skip_auth_regex" env:"OAUTH2_PROXY_SKIP_AUTH_REGEX"`
@@ -117,6 +116,7 @@ type Options struct {
 	proxyURLs          []*url.URL
 	CompiledRegex      []*regexp.Regexp
 	provider           providers.Provider
+	sessionStore       sessionsapi.SessionStore
 	signatureData      *SignatureData
 	oidcVerifier       *oidc.IDTokenVerifier
 	jwtBearerVerifiers []*oidc.IDTokenVerifier
@@ -131,16 +131,21 @@ type SignatureData struct {
 // NewOptions constructs a new Options with defaulted values
 func NewOptions() *Options {
 	return &Options{
-		ProxyPrefix:           "/oauth2",
-		ProxyWebSockets:       true,
-		HTTPAddress:           "127.0.0.1:4180",
-		HTTPSAddress:          ":443",
-		DisplayHtpasswdForm:   true,
-		CookieName:            "_oauth2_proxy",
-		CookieSecure:          true,
-		CookieHTTPOnly:        true,
-		CookieExpire:          time.Duration(168) * time.Hour,
-		CookieRefresh:         time.Duration(0),
+		ProxyPrefix:         "/oauth2",
+		ProxyWebSockets:     true,
+		HTTPAddress:         "127.0.0.1:4180",
+		HTTPSAddress:        ":443",
+		DisplayHtpasswdForm: true,
+		CookieOptions: options.CookieOptions{
+			CookieName:     "_oauth2_proxy",
+			CookieSecure:   true,
+			CookieHTTPOnly: true,
+			CookieExpire:   time.Duration(168) * time.Hour,
+			CookieRefresh:  time.Duration(0),
+		},
+		SessionOptions: options.SessionOptions{
+			Type: "cookie",
+		},
 		SetXAuthRequest:       false,
 		SkipAuthPreflight:     false,
 		PassBasicAuth:         true,
@@ -166,8 +171,8 @@ func NewOptions() *Options {
 	}
 }
 
-// JwtIssuer hold parsed JWT issuer info that's used to construct a verifier.
-type JwtIssuer struct {
+// jwtIssuer hold parsed JWT issuer info that's used to construct a verifier.
+type jwtIssuer struct {
 	issuerURI string
 	audience  string
 }
@@ -255,7 +260,7 @@ func (o *Options) Validate() error {
 		}
 		// Configure extra issuers
 		if len(o.ExtraJwtIssuers) > 0 {
-			var jwtIssuers []JwtIssuer
+			var jwtIssuers []jwtIssuer
 			jwtIssuers, msgs = parseJwtIssuers(o.ExtraJwtIssuers, msgs)
 			for _, jwtIssuer := range jwtIssuers {
 				verifier, err := newVerifierFromJwtIssuer(jwtIssuer)
@@ -291,7 +296,8 @@ func (o *Options) Validate() error {
 	}
 	msgs = parseProviderInfo(o, msgs)
 
-	if o.PassAccessToken || (o.CookieRefresh != time.Duration(0)) {
+	var cipher *cookie.Cipher
+	if o.PassAccessToken || o.SetAuthorization || o.PassAuthorization || (o.CookieRefresh != time.Duration(0)) {
 		validCookieSecretSize := false
 		for _, i := range []int{16, 24, 32} {
 			if len(secretBytes(o.CookieSecret)) == i {
@@ -313,14 +319,21 @@ func (o *Options) Validate() error {
 					"pass_access_token == true or "+
 					"cookie_refresh != 0, but is %d bytes.%s",
 				len(secretBytes(o.CookieSecret)), suffix))
+		} else {
+			var err error
+			cipher, err = cookie.NewCipher(secretBytes(o.CookieSecret))
+			if err != nil {
+				msgs = append(msgs, fmt.Sprintf("cookie-secret error: %v", err))
+			}
 		}
 	}
 
-	if o.RedisConnectionURL != "" {
-		_, err := redis.ParseURL(o.RedisConnectionURL)
-		if err != nil {
-			msgs = append(msgs, fmt.Sprintf("unable to parse redis url: %s", err))
-		}
+	o.SessionOptions.Cipher = cipher
+	sessionStore, err := sessions.NewSessionStore(&o.SessionOptions, &o.CookieOptions)
+	if err != nil {
+		msgs = append(msgs, fmt.Sprintf("error initialising session storage: %v", err))
+	} else {
+		o.sessionStore = sessionStore
 	}
 
 	if o.CookieRefresh >= o.CookieExpire {
@@ -446,9 +459,9 @@ func parseSignatureKey(o *Options, msgs []string) []string {
 }
 
 // parseJwtIssuers takes in an array of strings in the form of issuer=audience
-// and parses to an array of JwtIssuer structs.
-func parseJwtIssuers(issuers []string, msgs []string) ([]JwtIssuer, []string) {
-	var parsedIssuers []JwtIssuer
+// and parses to an array of jwtIssuer structs.
+func parseJwtIssuers(issuers []string, msgs []string) ([]jwtIssuer, []string) {
+	var parsedIssuers []jwtIssuer
 	for _, jwtVerifier := range issuers {
 		components := strings.Split(jwtVerifier, "=")
 		if len(components) < 2 {
@@ -456,14 +469,14 @@ func parseJwtIssuers(issuers []string, msgs []string) ([]JwtIssuer, []string) {
 			continue
 		}
 		uri, audience := components[0], strings.Join(components[1:], "=")
-		parsedIssuers = append(parsedIssuers, JwtIssuer{issuerURI: uri, audience: audience})
+		parsedIssuers = append(parsedIssuers, jwtIssuer{issuerURI: uri, audience: audience})
 	}
 	return parsedIssuers, msgs
 }
 
-// newVerifierFromJwtIssuer takes in issuer information in JwtIssuer info and returns
+// newVerifierFromJwtIssuer takes in issuer information in jwtIssuer info and returns
 // a verifier for that issuer.
-func newVerifierFromJwtIssuer(jwtIssuer JwtIssuer) (*oidc.IDTokenVerifier, error) {
+func newVerifierFromJwtIssuer(jwtIssuer jwtIssuer) (*oidc.IDTokenVerifier, error) {
 	config := &oidc.Config{
 		ClientID: jwtIssuer.audience,
 	}
