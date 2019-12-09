@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	b64 "encoding/base64"
 	"errors"
 	"fmt"
@@ -16,10 +17,10 @@ import (
 
 	"github.com/coreos/go-oidc"
 	"github.com/mbland/hmacauth"
-	"github.com/pusher/oauth2_proxy/cookie"
-	"github.com/pusher/oauth2_proxy/logger"
 	sessionsapi "github.com/pusher/oauth2_proxy/pkg/apis/sessions"
 	"github.com/pusher/oauth2_proxy/pkg/sessions/redis"
+	"github.com/pusher/oauth2_proxy/pkg/encryption"
+	"github.com/pusher/oauth2_proxy/pkg/logger"
 	"github.com/pusher/oauth2_proxy/providers"
 	"github.com/yhat/wsutil"
 )
@@ -99,6 +100,7 @@ type OAuthProxy struct {
 	jwtBearerVerifiers  []*oidc.IDTokenVerifier
 	compiledRegex       []*regexp.Regexp
 	templates           *template.Template
+	Banner              string
 	Footer              string
 }
 
@@ -128,9 +130,14 @@ func (u *UpstreamProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // NewReverseProxy creates a new reverse proxy for proxying requests to upstream
 // servers
-func NewReverseProxy(target *url.URL, flushInterval time.Duration) (proxy *httputil.ReverseProxy) {
+func NewReverseProxy(target *url.URL, opts *Options) (proxy *httputil.ReverseProxy) {
 	proxy = httputil.NewSingleHostReverseProxy(target)
-	proxy.FlushInterval = flushInterval
+	proxy.FlushInterval = opts.FlushInterval
+	if opts.SSLUpstreamInsecureSkipVerify {
+		proxy.Transport = &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		}
+	}
 	return proxy
 }
 
@@ -161,9 +168,9 @@ func NewFileServer(path string, filesystemPath string) (proxy http.Handler) {
 }
 
 // NewWebSocketOrRestReverseProxy creates a reverse proxy for REST or websocket based on url
-func NewWebSocketOrRestReverseProxy(u *url.URL, opts *Options, auth hmacauth.HmacAuth) (restProxy http.Handler) {
+func NewWebSocketOrRestReverseProxy(u *url.URL, opts *Options, auth hmacauth.HmacAuth) http.Handler {
 	u.Path = ""
-	proxy := NewReverseProxy(u, opts.FlushInterval)
+	proxy := NewReverseProxy(u, opts)
 	if !opts.PassHostHeader {
 		setProxyUpstreamHostHeader(proxy, u)
 	} else {
@@ -177,7 +184,12 @@ func NewWebSocketOrRestReverseProxy(u *url.URL, opts *Options, auth hmacauth.Hma
 		wsURL := &url.URL{Scheme: wsScheme, Host: u.Host}
 		wsProxy = wsutil.NewSingleHostReverseProxy(wsURL)
 	}
-	return &UpstreamProxy{u.Host, proxy, wsProxy, auth}
+	return &UpstreamProxy{
+		upstream:  u.Host,
+		handler:   proxy,
+		wsHandler: wsProxy,
+		auth:      auth,
+	}
 }
 
 // NewOAuthProxy creates a new instance of OOuthProxy from the options provided
@@ -202,7 +214,13 @@ func NewOAuthProxy(opts *Options, validator func(string) bool) *OAuthProxy {
 			}
 			logger.Printf("mapping path %q => file system %q", path, u.Path)
 			proxy := NewFileServer(path, u.Path)
-			serveMux.Handle(path, &UpstreamProxy{path, proxy, nil, nil})
+			uProxy := UpstreamProxy{
+				upstream:  path,
+				handler:   proxy,
+				wsHandler: nil,
+				auth:      nil,
+			}
+			serveMux.Handle(path, &uProxy)
 		default:
 			panic(fmt.Sprintf("unknown upstream protocol %s", u.Scheme))
 		}
@@ -243,7 +261,7 @@ func NewOAuthProxy(opts *Options, validator func(string) bool) *OAuthProxy {
 		Validator:      validator,
 
 		RobotsPath:        "/robots.txt",
-		PingPath:          "/ping",
+		PingPath:          opts.PingPath,
 		SignInPath:        fmt.Sprintf("%s/sign_in", opts.ProxyPrefix),
 		SignOutPath:       fmt.Sprintf("%s/sign_out", opts.ProxyPrefix),
 		OAuthStartPath:    fmt.Sprintf("%s/start", opts.ProxyPrefix),
@@ -270,6 +288,7 @@ func NewOAuthProxy(opts *Options, validator func(string) bool) *OAuthProxy {
 		PassAuthorization:   opts.PassAuthorization,
 		SkipProviderButton:  opts.SkipProviderButton,
 		templates:           loadTemplates(opts.CustomTemplatesDir),
+		Banner:              opts.Banner,
 		Footer:              opts.Footer,
 	}
 }
@@ -572,7 +591,7 @@ func (p *OAuthProxy) SignOut(rw http.ResponseWriter, req *http.Request) {
 
 // OAuthStart starts the OAuth2 authentication flow
 func (p *OAuthProxy) OAuthStart(rw http.ResponseWriter, req *http.Request) {
-	nonce, err := cookie.Nonce()
+	nonce, err := encryption.Nonce()
 	if err != nil {
 		logger.Printf("Error obtaining nonce: %s", err.Error())
 		p.ErrorPage(rw, 500, "Internal Error", err.Error())
@@ -802,32 +821,60 @@ func (p *OAuthProxy) addHeadersForProxying(rw http.ResponseWriter, req *http.Req
 		req.Header["X-Forwarded-User"] = []string{session.User}
 		if session.Email != "" {
 			req.Header["X-Forwarded-Email"] = []string{session.Email}
+		} else {
+			req.Header.Del("X-Forwarded-Email")
 		}
 	}
+
 	if p.PassUserHeaders {
 		req.Header["X-Forwarded-User"] = []string{session.User}
 		if session.Email != "" {
 			req.Header["X-Forwarded-Email"] = []string{session.Email}
+		} else {
+			req.Header.Del("X-Forwarded-Email")
 		}
 	}
+
 	if p.SetXAuthRequest {
 		rw.Header().Set("X-Auth-Request-User", session.User)
 		if session.Email != "" {
 			rw.Header().Set("X-Auth-Request-Email", session.Email)
+		} else {
+			rw.Header().Del("X-Auth-Request-Email")
 		}
-		if p.PassAccessToken && session.AccessToken != "" {
-			rw.Header().Set("X-Auth-Request-Access-Token", session.AccessToken)
+
+		if p.PassAccessToken {
+			if session.AccessToken != "" {
+				rw.Header().Set("X-Auth-Request-Access-Token", session.AccessToken)
+			} else {
+				rw.Header().Del("X-Auth-Request-Access-Token")
+			}
 		}
 	}
-	if p.PassAccessToken && session.AccessToken != "" {
-		req.Header["X-Forwarded-Access-Token"] = []string{session.AccessToken}
+
+	if p.PassAccessToken {
+		if session.AccessToken != "" {
+			req.Header["X-Forwarded-Access-Token"] = []string{session.AccessToken}
+		} else {
+			req.Header.Del("X-Forwarded-Access-Token")
+		}
 	}
-	if p.PassAuthorization && session.IDToken != "" {
-		req.Header["Authorization"] = []string{fmt.Sprintf("Bearer %s", session.IDToken)}
+
+	if p.PassAuthorization {
+		if session.IDToken != "" {
+			req.Header["Authorization"] = []string{fmt.Sprintf("Bearer %s", session.IDToken)}
+		} else {
+			req.Header.Del("Authorization")
+		}
 	}
-	if p.SetAuthorization && session.IDToken != "" {
-		rw.Header().Set("Authorization", fmt.Sprintf("Bearer %s", session.IDToken))
+	if p.SetAuthorization {
+		if session.IDToken != "" {
+			rw.Header().Set("Authorization", fmt.Sprintf("Bearer %s", session.IDToken))
+		} else {
+			rw.Header().Del("Authorization")
+		}
 	}
+
 	if session.Email == "" {
 		rw.Header().Set("GAP-Auth", session.User)
 	} else {
@@ -880,7 +927,7 @@ func isAjax(req *http.Request) bool {
 	return false
 }
 
-// ErrorJSON returns the error code witht an application/json mime type
+// ErrorJSON returns the error code with an application/json mime type
 func (p *OAuthProxy) ErrorJSON(rw http.ResponseWriter, code int) {
 	rw.Header().Set("Content-Type", applicationJSON)
 	rw.WriteHeader(code)
